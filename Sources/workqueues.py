@@ -197,15 +197,15 @@ class Pool:
 		self.capacity = capacity
 		self.elements = []
 
-	def submit(self, job):
+	def submit(self, job, sync=False):
+		# FIXME: This should be a blocking operation, and should only return
+		# a worker when it's available
 		if self.canAdd():
-			self.elements.append(element)
-			return True
+			worker = Worker().setJob(job)
+			self.elements.append(worker)
+			return worker
 		else:
-			return False
-
-	def _getWorkerForJob( self, job ):
-		return Worker(job)
+			return None
 
 	def canAdd(self):
 		return len(self.elements) < self.capacity
@@ -305,15 +305,17 @@ class Queue:
 			self.resubmit(job)
 		return incident
 
-	def process( self, count=1 ):
-		while count > 0 and self._hasJobs():
+	def iterate( self, count=-1 ):
+		print "HAS JOBS", self._hasJobs()
+		while (count == -1 or count > 0) and self._hasJobs():
 			# Takes the next available job
 			job = self._getNextJob()
+			print "JOB", job
 			# Makes sure it's time to execute it
 			# ...if not, we return the time we have to wait up until the next event
 			# Makes sure the pool can process the event
 			# ...if not, we return the maximum time in which the pool will be free/or a callback to when the pool will be free
-			worker = pool.getWorker(job)
+			worker = self.pool.submit(job)
 			# Now we have the worker and we ask it to run the job
 			result = worker.run()
 			if   isinstance(result, Success):
@@ -324,10 +326,11 @@ class Queue:
 			else:
 				self.failed(job, UnexpectedResult(result))
 			yield result
+			if count > 0: count -= 1
 
-	def run( self ):
-		# TODO: Runs with a scheduler
-		pass
+	def run( self, count=-1 ):
+		for _ in self.iterate(count):
+			print _
 
 	def _getNextJob( self ):
 		"""Returns the next job and sets it as selected in this queue"""

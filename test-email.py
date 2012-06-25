@@ -66,5 +66,5 @@ if __name__ == "__main__":
 	pool  = Pool(5)
 	queue.setPool(pool)
 	# And we call "process" which will process everything
-	queue.process()
+	queue.run()
 # EOF

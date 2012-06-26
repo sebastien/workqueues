@@ -399,6 +399,9 @@ class Incident:
 				callback(self)
 			except Exception, e:
 				err("Exception in incident's callback: %s" % (e))
+	
+	def __str__( self ):
+		return "%s:%s" % (self.jobTag, self.failureTag)
 
 # -----------------------------------------------------------------------------
 #
@@ -436,10 +439,11 @@ class Queue:
 		return self._addJob(job)
 
 	def resubmit( self, job ):
-		assert job.id != None
+		assert job.id != None, "You cannot resumbit a job without an id: %s" % (job)
 		# We increase the number of retries in the job
 		job.retries += 1
 		self._updateJobStatus(job, JOB_RESUBMITTED)
+		self._readdJob(job)
 
 	def remove( self, job ):
 		"""Removes the job from the queue"""
@@ -484,7 +488,6 @@ class Queue:
 	def run( self, count=-1 ):
 		iteration = 0
 		for result in self.iterate(count):
-			log("Iteration", iteration, ":", result)
 			iteration += 1
 
 	def _getNextJob( self ):
@@ -505,6 +508,12 @@ class Queue:
 		self.jobs.append(job)
 		return job.setID("%s@%s" % (len(self.jobs) - 1, time.time())).id
 
+	def _readdJob( self, job ):
+		"""Adds an existing job to the queue and returns its ID (assigned by the queue)"""
+		# FIXME: Should be synchronized
+		self.jobs.append(job)
+		return job.id
+
 	def _removeJob( self, job ):
 		# NOTE: This is pretty simple, but should be optimized for big queues
 		self.jobs.remove(job)
@@ -523,13 +532,16 @@ class Queue:
 		if incident.isAboveThreshold():
 			# If the incident is above threshold, we won't retry the job,
 			# as it's likely to fail again
+			warn(self.__class__.__name__, ": job removed as incident is above threshold:", job.id, ":", incident)
 			self.remove(job)
 		elif job.canRetry():
 			# If the incident is not above threshold, and the job has not
 			# reached its retry count, we resubmit it
+			warn(self.__class__.__name__, ": job resubmitted:", job.id, "/", job.retries)
 			self.resubmit(job)
 		else:
 			# Otherwise we remove the job from the queue
+			warn(self.__class__.__name__, ": job reached maximum retries:", job.id, "/", job.retries)
 			self.remove(job)
 		return incident
 

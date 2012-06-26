@@ -1,4 +1,4 @@
-import json
+import json, smtplib, string
 from   workqueues import *
 
 # email.password is a JSON file like this
@@ -14,20 +14,18 @@ class SendEmail(Job):
 	|
 	|${message}
 	|--
-	|Timestamp: ${timestamp}
-	|Iteration: ${iteration}
-	|Result:    ${result}
-	|--
 	""".replace("\t|", "")
 	DATA = ["to", "subject", "message"]
 
 	def __init__( self, to, subject, message, origin=None, **kwargs ):
 		Job.__init__(self, **kwargs)
-		self.to      = to
-		self.subject = subject
-		self.message = message
-		self.origin  = origin
-		self.host    = EMAIL["smtp"]
+		self.to       = to
+		self.subject  = subject
+		self.message  = message
+		self.origin   = origin
+		self.host     = EMAIL["smtp"]
+		self.user     = EMAIL["user"]
+		self.password = EMAIL["password"]
 	
 	def run( self ):
 		server  = smtplib.SMTP(self.host)
@@ -43,11 +41,8 @@ class SendEmail(Job):
 		server.ehlo()
 		if self.password:
 			server.login(self.user, self.password)
-		server.sendmail(origin, [self.user], message)
-		try:
-			server.quit()
-		except:
-			pass
+		server.sendmail(origin, [self.to], message)
+		server.quit()
 		return message
 
 if __name__ == "__main__":
@@ -57,7 +52,7 @@ if __name__ == "__main__":
 	for i in range(count):
 		job = SendEmail(
 			"sebastien@ffctn.com",
-			"Workqueue test %d/%d",
+			"Workqueue test %d/%d" % (i,count),
 			"This is a workqueue test message" 
 		)
 		queue.submit(job)

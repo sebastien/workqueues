@@ -187,6 +187,9 @@ class Job:
 		for field in self.DATA: data[field] = getattr(self, field)
 		return base
 	
+	def __str__( self ):
+		return "%s:%s" % (self.__class__.__name__, self.id)
+
 # -----------------------------------------------------------------------------
 #
 # WORKER
@@ -460,14 +463,19 @@ class Queue:
 		while (count == -1 or count > 0) and self._hasJobs():
 			# Takes the next available job
 			job = self._getNextJob()
+			self._updateJobStatus(job, JOB_SELECTED)
 			# Makes sure it's time to execute it
 			# ...if not, we return the time we have to wait up until the next event
 			# Makes sure the pool can process the event
 			# ...if not, we return the maximum time in which the pool will be free/or a callback to when the pool will be free
+			log(self.__class__.__name__, "submitting job", job)
 			worker = self.pool.submit(job, block=True)
 			# Now we have the worker and we ask it to run the job
+			log(self.__class__.__name__, "running job", job)
 			result = worker.run()
 			if   isinstance(result, Success):
+				log(self.__class__.__name__, "job succeeded", job, ":", result)
+				job.retries = 0
 				# the job is successfully processed
 				self._onJobSucceeded(job)
 			elif isinstance(result, Failure):
@@ -492,11 +500,10 @@ class Queue:
 
 	def _getNextJob( self ):
 		"""Returns the next job and sets it as selected in this queue"""
-		next_job = (self._lastSelected + 1) % len(self.jobs)
-		job = self._getJob(next_job)
-		self._lastSelected = next_job
-		self._updateJobStatus(job, JOB_SELECTED)
-		return job
+		if self.jobs:
+			return self.jobs[0]
+		else:
+			return None
 
 	def _hasJobs( self ):
 		"""Tells if there are still jobs submitted in the queue"""
@@ -519,11 +526,8 @@ class Queue:
 		self.jobs.remove(job)
 
 	def _onJobSucceeded( self, jobOrJobID ):
-		i = self._id(jobOrJobID)
-		self._job(jobOrJobID).retries = 0
-		self._lastProcessed = i
-		del self.jobs[i]
-		return i
+		job = self._job(jobOrJobID)
+		self.jobs.remove(job)
 
 	def _onJobFailed( self, job, failure ):
 		"""Called when a job has failed."""
@@ -557,11 +561,6 @@ class Queue:
 	def _updateJobStatus( self, jobOrJobID, status ):
 		"""Updates the status of this job."""
 
-	def _getJob( self, jobOrJobID ):
-		"""Gets the job with the given id from the job queue."""
-		i = self._id(jobOrJobID)
-		return self.jobs[i]
-
 	def _id( self, jobOrJobID ):
 		if isinstance(jobOrJobID, Job):
 			res = jobOrJobID.id
@@ -571,7 +570,15 @@ class Queue:
 			return jobOrJobID 
 
 	def _job( self, jobOrJobID ):
-		return self.jobs[self._id(jobOrJobID)]
+		if isinstance(jobOrJobID, Job):
+			return jobOrJobID
+		else:
+			for job in self.jobs:
+				if job.id == jobOrJobID:
+					return job
+			# NOTE: This should not happen!
+			return None
+
 
 # -----------------------------------------------------------------------------
 #

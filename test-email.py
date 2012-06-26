@@ -15,9 +15,9 @@ class SendEmail(Job):
 	|${message}
 	|--
 	""".replace("\t|", "")
-	DATA = ["to", "subject", "message"]
+	DATA = ["to", "subject", "message", "origin"]
 
-	def __init__( self, to, subject, message, origin=None, **kwargs ):
+	def __init__( self, to=None, subject=None, message=None, origin=None, **kwargs ):
 		Job.__init__(self, **kwargs)
 		self.to       = to
 		self.subject  = subject

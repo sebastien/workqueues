@@ -9,7 +9,9 @@
 # Last mod  : 26-Jun-2012
 # -----------------------------------------------------------------------------
 
-import os, threading, subprocess, time, sys
+import os, threading, subprocess, time, datetime, sys, json
+
+# TODO: Make cleaner, smaller loggin messages
 
 __doc__ = """\
 """
@@ -140,6 +142,15 @@ class Job:
 	RUN           = AS_FUNCTION
 	RETRIES       = 5
 	RETRIES_DELAY = (60 * 1, 60 * 5, 60 * 10, 60 * 15)
+
+	@classmethod
+	def Import( cls, data ):
+		job = cls()
+		for _ in ["timeout", "scheduled", "submitted", "until", "frequency", "repeat", "id", "retries", "lastRun"]:
+			setattr(job, _, data[_])
+		for _ in data["data"]:
+			setattr(job, _, data["data"][_])
+		return job
 
 	def __init__( self ):
 		self.timeout   = -1
@@ -412,7 +423,6 @@ class Incident:
 #
 # -----------------------------------------------------------------------------
 
-# FIXME: Separate MemoryQueue of the abstract queue
 class Queue:
 
 	# FIXME: Add support for that
@@ -446,7 +456,7 @@ class Queue:
 		# We increase the number of retries in the job
 		job.retries += 1
 		self._updateJobStatus(job, JOB_RESUBMITTED)
-		self._readdJob(job)
+		self._resubmitJob(job)
 
 	def remove( self, job ):
 		"""Removes the job from the queue"""
@@ -498,32 +508,9 @@ class Queue:
 		for result in self.iterate(count):
 			iteration += 1
 
-	def _getNextJob( self ):
-		"""Returns the next job and sets it as selected in this queue"""
-		if self.jobs:
-			return self.jobs[0]
-		else:
-			return None
-
-	def _hasJobs( self ):
-		"""Tells if there are still jobs submitted in the queue"""
-		return self.jobs
-
-	def _addJob( self, job ):
-		"""Adds a new job to the queue and returns its ID (assigned by the queue)"""
-		# FIXME: Should be synchronized
-		self.jobs.append(job)
-		return job.setID("%s@%s" % (len(self.jobs) - 1, time.time())).id
-
-	def _readdJob( self, job ):
-		"""Adds an existing job to the queue and returns its ID (assigned by the queue)"""
-		# FIXME: Should be synchronized
-		self.jobs.append(job)
-		return job.id
-
-	def _removeJob( self, job ):
-		# NOTE: This is pretty simple, but should be optimized for big queues
-		self.jobs.remove(job)
+	def _updateJobStatus( self, jobOrJobID, status ):
+		"""Updates the status of this job."""
+		# FIXME: Implement me
 
 	def _onJobSucceeded( self, jobOrJobID ):
 		job = self._job(jobOrJobID)
@@ -558,8 +545,7 @@ class Queue:
 		self.incidents.append(incident)
 		return incident
 
-	def _updateJobStatus( self, jobOrJobID, status ):
-		"""Updates the status of this job."""
+	# JOB-ID CONVERSIONS
 
 	def _id( self, jobOrJobID ):
 		if isinstance(jobOrJobID, Job):
@@ -579,6 +565,67 @@ class Queue:
 			# NOTE: This should not happen!
 			return None
 
+	# BACK-END SPECIFIC METHODS
+
+	def _getNextJob( self ):
+		"""Returns the next job and sets it as selected in this queue"""
+		raise Exception("Not implemented yet")
+
+	def _hasJobs( self ):
+		"""Tells if there are still jobs submitted in the queue"""
+		raise Exception("Not implemented yet")
+
+	def _addJob( self, job ):
+		"""Adds a new job to the queue and returns its ID (assigned by the queue)"""
+		raise Exception("Not implemented yet")
+
+	def _resubmitJob( self, job ):
+		"""Adds an existing job to the queue and returns its ID (assigned by the queue)"""
+		raise Exception("Not implemented yet")
+
+	def _removeJob( self, job ):
+		raise Exception("Not implemented yet")
+
+
+# -----------------------------------------------------------------------------
+#
+# MEMORY QUEUE
+#
+# -----------------------------------------------------------------------------
+
+class MemoryQueue(Queue):
+
+	def __init__( self ):
+		Queue.__init__(self)
+		self.jobs = []
+
+	def _getNextJob( self ):
+		"""Returns the next job and sets it as selected in this queue"""
+		if self.jobs:
+			return self.jobs[0]
+		else:
+			return None
+
+	def _hasJobs( self ):
+		"""Tells if there are still jobs submitted in the queue"""
+		return self.jobs
+
+	def _addJob( self, job ):
+		"""Adds a new job to the queue and returns its ID (assigned by the queue)"""
+		# FIXME: Should be synchronized
+		self.jobs.append(job)
+		return job.setID("%s@%s" % (len(self.jobs) - 1, time.time())).id
+
+	def _resubmitJob( self, job ):
+		"""Adds an existing job to the queue and returns its ID (assigned by the queue)"""
+		# FIXME: Should be synchronized
+		self.jobs.append(job)
+		return job.id
+
+	def _removeJob( self, job ):
+		# NOTE: This is pretty simple, but should be optimized for big queues
+		self.jobs.remove(job)
+
 
 # -----------------------------------------------------------------------------
 #
@@ -588,12 +635,67 @@ class Queue:
 
 class DirectoryQueue(Queue):
 
+	# FIXME: Should use systems's directory watching
+
+	SUFFIX = ".jobs"
+
 	def __init__( self, path ):
 		Queue.__init__(self)
 		self.path = path
 		# We create the directory if it does not exist
 		if not os.path.exists(path):
 			os.makedirs(path)
+
+	def timestamp( self ):
+		now = datetime.datetime.now()
+		return "%04d%02d%02dT%02d:%02d%02d%d" % (
+			now.year, now.month, now.day, now.hour, now.minute, now.second, now.microsecond
+		)
+
+	def _getPath( self, job ):
+		if isinstance(job, Job): job_id = job.id
+		else: job_id = job
+		return self.path + "/" + job_id + ".json"
+
+	def _listJobs( self ):
+		for _ in os.listdir(self.path):
+			if _.endswith(self.SUFFIX):
+				yield _[:len(self.SUFFIX)]
+
+	def _addJob( self, job ):
+		"""Adds a new job to the queue and returns its ID (assigned by the queue)"""
+		new_id = self.timestamp() + "-" + job.__class__.__name__
+		job.setID(new_id)
+		with file(self._getPath(job), "wb") as f:
+			json.dump(job.export(), f)
+		return job.id
+
+	def _getNextJob( self ):
+		"""Returns the next job and sets it as selected in this queue"""
+		iterator = self._listJobs()
+		job      = iterator.next()
+		path     = self._getPath(job)
+		with file(path, "rb") as f:
+			job = Job.Import(json.load(f))
+		return job
+
+	def _hasJobs( self ):
+		"""Tells if there are still jobs submitted in the queue"""
+		iterator = self._listJobs()
+		try:
+			iterator.next()
+			return True
+		except StopIteration, e:
+			return False
+
+	def _resubmitJob( self, job ):
+		"""Adds an existing job to the queue and returns its ID (assigned by the queue)"""
+		with file(self._getPath(job), "wb") as f:
+			json.dump(job.export(), f)
+		return job.id
+
+	def _removeJob( self, job ):
+		os.unlink(self._getPath(job))
 
 # -----------------------------------------------------------------------------
 #

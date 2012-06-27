@@ -48,6 +48,7 @@ class SendEmail(Job):
 if __name__ == "__main__":
 	# This is is the "client" part, ie. where we submit jobs to the queue
 	queue = DirectoryQueue("Queue")
+	Job.Register(SendEmail)
 	count = 10
 	for i in range(count):
 		job = SendEmail(

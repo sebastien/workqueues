@@ -99,6 +99,14 @@ class Frequency:
 
 class Result:
 
+	@classmethod
+	def Import( self, data ):
+		result_class    = eval(data["type"])
+		result          = result_class(data["value"])
+		result.duration = data["duration"]
+		result.started  = data["started"]
+		return result
+
 	def __init__( self, value ):
 		self.duration = -1
 		self.started  = timestamp()
@@ -215,6 +223,10 @@ class Job:
 		for _ in ["timeout", "scheduled", "submitted", "until", "frequency", "repeat", "id", "retries", "lastRun"]:
 			if data.has_key(_):
 				setattr(job, _, data[_])
+		if data.get("result"):
+			result_json = data["result"]
+			result = Result.Import(result_json)
+			job.result = result
 		for _ in data["data"]:
 			if data["data"].has_key(_):
 				setattr(job, _, data["data"][_])
@@ -235,6 +247,12 @@ class Job:
 		self.result       = None
 		assert "id" not in self.DATA, "DATA does not allow an 'id' attribute"
 
+	def isComplete( self ):
+		return self.result and isinstance(self.result, Success)
+
+	def hasFailed( self ):
+		return self.result and isinstance(self.result, Failure)
+
 	def getRunType( self ):
 		"""Returns the run type of this job, as defined by the job's `RUN` attribute"""
 		return self.RUN
@@ -252,6 +270,7 @@ class Job:
 		a Result instance if necessary."""
 		if not isinstance(result, Result): result = Result(result)
 		self.result = result
+		return result
 
 	def canRetry( self ):
 		"""Tells if this job can be retried (ie. `self.retries < self.RETRIES`)"""
@@ -268,6 +287,9 @@ class Job:
 
 	def export( self ):
 		data = {}
+		result_export = None
+		if self.result:
+			result_export = self.result.export()
 		base = dict(
 			type      = self.__class__.__module__ + "." + self.__class__.__name__.split(".")[-1],
 			timeout   = self.timeout,
@@ -276,7 +298,7 @@ class Job:
 			frequency = self.frequency,
 			repeat    = self.repeat,
 			data      = data,
-			result    = self.result and asJSON(self.result.export()) or None
+			result    = result_export
 		)
 		for field in self.DATA: data[field] = getattr(self, field)
 		return base
@@ -324,8 +346,7 @@ class Worker:
 		else:
 			result = Failure("Uknown job run type: %s" % (self.runType))
 		# The job is assigned a result
-		self.job = result
-		# NOTE: We cannot
+		self.job.setResult(result)
 		return result
 
 	def doJobEnd( self, result ):

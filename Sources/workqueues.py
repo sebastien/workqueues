@@ -6,12 +6,21 @@
 # License   : Revised BSD License
 # -----------------------------------------------------------------------------
 # Creation  : 21-Jun-2012
-# Last mod  : 27-Jun-2012
+# Last mod  : 04-Jul-2012
 # -----------------------------------------------------------------------------
 
 import os, threading, subprocess, time, datetime, sys, json
+try:
+	from   retro.core import asJSON
+except ImportError:
+	import json.dumps as     asJSON
 
-# TODO: Make cleaner, smaller loggin messages
+# TODO: Generator support in Job's run() to divide work?
+# TODO : Add support for storing the job's results -- queues should probably
+# have different queues: backburner (for not schedules), incoming:(to be processed),
+# processing(being processed), failed:(jobs failed and permanently removed), completed:(completed)
+# FIXME: Make sure that exceptions are well caught everywhere. For instance
+# DirectoryQueuw will just fail if it cannot decode the JSON
 
 __doc__ = """\
 """
@@ -26,14 +35,32 @@ AS_FUNCTION      = "function"
 AS_THREAD        = "thread"
 AS_PROCESS       = "process"
 
+QUEUE_INCOMING   = "incoming"
+QUEUE_PROCESSING = "procesing"
+QUEUE_FAILED     = "failed"
+QUEUE_COMPLETED  = "completed"
 # States for jobs
+# JOB:
+# 
+# 	STATES = dict(
+# 		"submitted"   : ("resubmitted", "completed", "failed")
+# 		"resubmitted" : ("resubmitted", "completed", "failed")
+# 		"failed"      : None
+# 		"completed""  : None
+# 	)
+
 JOB_SUBMITTED    = "submitted"
 JOB_RESUBMITTED  = "resubmitted"
 JOB_SELECTED     = "selected"
 JOB_IN_PROCESS   = "inprocess"
-JOB_COMPLETED    = "removed"
-JOB_REMOVED      = "removed"
+JOB_COMPLETED    = "completed"
+JOB_FAILED       = "completed"
 JOB_CLASSES      = {}
+
+def timestamp(t=None):
+	"""Returns the current time as an UTC timestamp in seconds"""
+	if t is None: t = time.time()
+	return datetime.datetime.utcfromtimestamp(t)
 
 # -----------------------------------------------------------------------------
 #
@@ -74,7 +101,7 @@ class Result:
 
 	def __init__( self, value ):
 		self.duration = -1
-		self.started  = None
+		self.started  = timestamp()
 		self.value    = value
 
 	def isSuccess( self ):
@@ -91,6 +118,14 @@ class Result:
 
 	def happenedBefore( self, t ):
 		return self.started < t
+
+	def export( self ):
+		return dict(
+			type=self.__class__.__name__.split(".")[-1],
+			value=self.value,
+			started=self.started,
+			duration=self.duration
+		)
 
 class Success(Result):
 
@@ -111,10 +146,10 @@ class Failure(Result):
 		return True
 
 	def __str__(self):
-		if self.value:
-			return "%s:%s (%s) in %s:%s" % (self.__class__.__name__, self.description, self.value, self.job.__class__.__name__, self.job.id)
-		else:
-			return "%s:%s in %s:%s" % (self.__class__.__name__, self.description, self.job.__class__.__name__, self.job.id)
+		res = "%s:%s" % (self.__class__.__name__, self.description)
+		if self.value: res += " (%s)"     % (self.value)
+		if self.job:   res += " in %s:%s" % (self.job.__class__.__name__, self.job.id)
+		return res
 
 class Timeout(Failure):
 
@@ -146,9 +181,14 @@ class Job:
 	RETRIES_DELAY = (60 * 1, 60 * 5, 60 * 10, 60 * 15)
 
 	@classmethod
+	def Registered( cls, jobClass ):
+		cls.Register(jobClass)
+		return jobClass
+
+	@classmethod
 	def Register( cls, *jobClasses ):
 		for job_class in jobClasses:
-			name = job_class.__name__
+			name = job_class.__module__ + "." + job_class.__name__.split(".")[-1]
 			if not JOB_CLASSES.has_key(name):
 				JOB_CLASSES[name] = job_class
 
@@ -180,17 +220,19 @@ class Job:
 				setattr(job, _, data["data"][_])
 		return job
 
-	def __init__( self ):
-		self.timeout   = -1
-		self.scheduled = -1
-		self.submitted = -1
-		self.until     = -1
-		self.frequency = None
-		self.repeat    = -1
-		self.id        = None
-		self.retries   = 0
-		self.lastRun   = -1
+	def __init__( self, env=None ):
+		self.timeout      = -1
+		self.scheduled    = -1
+		self.submitted    = -1
+		self.until        = -1
+		self.frequency    = None
+		self.repeat       = -1
+		self.id           = None
+		self.retries      = 0
+		self.lastRun      = -1
+		self.env          = env
 		self.isUnresolved = False
+		self.result       = None
 		assert "id" not in self.DATA, "DATA does not allow an 'id' attribute"
 
 	def getRunType( self ):
@@ -205,6 +247,12 @@ class Job:
 		self.id = jobID
 		return self
 
+	def setResult( self, result ):
+		"""Sets the result obtained from running this job, wrapping it in 
+		a Result instance if necessary."""
+		if not isinstance(result, Result): result = Result(result)
+		self.result = result
+
 	def canRetry( self ):
 		"""Tells if this job can be retried (ie. `self.retries < self.RETRIES`)"""
 		return self.retries < self.RETRIES
@@ -214,25 +262,30 @@ class Job:
 		i = max(0, min(len(self.RETRIES_DELAY), self.retries) - 1)
 		return self.RETRIES_DELAY[i]
 
+	def run( self ):
+		"""The main Job function that you'll override when implementing the Job"""
+		raise Exception("Job.run not implemented")
+
 	def export( self ):
 		data = {}
 		base = dict(
-			type      = self.__class__.__name__,
+			type      = self.__class__.__module__ + "." + self.__class__.__name__.split(".")[-1],
 			timeout   = self.timeout,
 			scheduled = self.scheduled,
 			until     = self.until,
 			frequency = self.frequency,
 			repeat    = self.repeat,
-			data      = data
+			data      = data,
+			result    = self.result and asJSON(self.result.export()) or None
 		)
 		for field in self.DATA: data[field] = getattr(self, field)
 		return base
 	
 	def __str__( self ):
 		if self.isUnresolved:
-			return "%s[UNRESOLVED](%s):%s" % (self.isUnresolved["type"], self.id, json.dumps(self.isUnresolved["data"]))
+			return "%s[UNRESOLVED](%s):%s" % (self.isUnresolved["type"], self.id, asJSON(self.isUnresolved["data"]))
 		else:
-			return "%s(%s):%s" % (self.__class__.__name__, self.id, json.dumps(self.export()["data"]))
+			return "%s(%s):%s" % (self.__class__.__name__, self.id, asJSON(self.export()["data"]))
 
 # -----------------------------------------------------------------------------
 #
@@ -270,6 +323,8 @@ class Worker:
 			result = Failure("Job run type %s not implemented" % (self.runType))
 		else:
 			result = Failure("Uknown job run type: %s" % (self.runType))
+		# The job is assigned a result
+		self.job = result
 		# NOTE: We cannot
 		return result
 
@@ -292,7 +347,7 @@ class Worker:
 		try:
 			result = Success(job.run())
 		except Exception, e:
-			result = Failure(e)
+			result = Failure(e, job=job)
 		self._setResultTime(result, start_time)
 		# We have to put the doJobEnd here, as callbacks might fail or 
 		# take too long
@@ -482,7 +537,9 @@ class Queue:
 		"""Submit a new job or a list of jobs in this queue"""
 		if type(job) in (tuple, list):
 			return map(self.submit, job)
-		return self._addJob(job)
+		else:
+			job.submitted = timestamp ()
+			return self._submitJob(job)
 
 	def resubmit( self, job ):
 		assert job.id != None, "You cannot resumbit a job without an id: %s" % (job)
@@ -490,15 +547,22 @@ class Queue:
 		job.retries += 1
 		self._updateJobStatus(job, JOB_RESUBMITTED)
 		self._resubmitJob(job)
-
-	def remove( self, job ):
-		"""Removes the job from the queue"""
+	
+	def failure( self, job ):
+		"""Removes the job from the queue after too many failures"""
 		assert job.id != None
-		self._updateJobStatus(job, JOB_REMOVED)
-		self._removeJob(job)
+		self._updateJobStatus(job, JOB_FAILED)
+		self._failedJob(job)
 		return job
 
-	def list( self, until=None, since=None, status=None ):
+	def complete( self, job ):
+		"""Removes the job from the queue"""
+		assert job.id != None
+		self._updateJobStatus(job, JOB_COMPLETED)
+		self._completeJob(job)
+		return job
+
+	def list( self, until=None, since=None, status=None, queue=None ):
 		"""Lists the jobs ids in the job queue, by ascending chronological order"""
 		return  self._listJobs()
 
@@ -515,16 +579,20 @@ class Queue:
 			# ...if not, we return the time we have to wait up until the next event
 			# Makes sure the pool can process the event
 			# ...if not, we return the maximum time in which the pool will be free/or a callback to when the pool will be free
-			log(self.__class__.__name__, "SUBMIT  ", job)
-			worker = self.pool.submit(job, block=True)
-			# Now we have the worker and we ask it to run the job
-			log(self.__class__.__name__, "RUNNING ", job)
-			result = worker.run()
+			log(self.__class__.__name__, "SUBMIT   ", job)
+			if not job.isUnresolved:
+				worker = self.pool.submit(job, block=True)
+				# Now we have the worker and we ask it to run the job
+				log(self.__class__.__name__, "RUNNING  ", job)
+				result = worker.run()
+			else:
+				log(self.__class__.__name__, "UNKNOWN  ", job)
+				result  = Failure("Unresolved job")
 			if   isinstance(result, Success):
-				log(self.__class__.__name__, "SUCCESS ", job, ":", result)
+				log(self.__class__.__name__, "SUCCESS  ", job, ":", result)
 				job.retries = 0
 				# the job is successfully processed
-				self._onJobSucceeded(job)
+				self._onJobSucceeded(job, result)
 			elif isinstance(result, Failure):
 				self._onJobFailed(job, result)
 			else:
@@ -549,10 +617,10 @@ class Queue:
 		"""Updates the status of this job."""
 		# FIXME: Implement me
 
-	def _onJobSucceeded( self, jobOrJobID ):
+	def _onJobSucceeded( self, jobOrJobID, result ):
 		job = self._job(jobOrJobID)
 		self._updateJobStatus( jobOrJobID, JOB_COMPLETED )
-		self._removeJob(job)
+		self._completeJob(job)
 
 	def _onJobFailed( self, job, failure ):
 		"""Called when a job has failed."""
@@ -561,17 +629,17 @@ class Queue:
 		if incident.isAboveThreshold():
 			# If the incident is above threshold, we won't retry the job,
 			# as it's likely to fail again
-			warn(self.__class__.__name__, "INCIDENT", job.id, ":", incident)
-			self.remove(job)
+			warn(self.__class__.__name__, "!INCIDENT", job.id, ":", incident)
+			self.failure(job)
 		elif job.canRetry():
 			# If the incident is not above threshold, and the job has not
 			# reached its retry count, we resubmit it
-			warn(self.__class__.__name__, "RESUBMIT", job.id, "/", job.retries)
+			warn(self.__class__.__name__, "!RESUBMIT", job.id, "/", job.retries)
 			self.resubmit(job)
 		else:
 			# Otherwise we remove the job from the queue
-			warn(self.__class__.__name__, "MAXRETRY", job.id, "/", job.retries)
-			self.remove(job)
+			warn(self.__class__.__name__, "!MAXRETRY", job.id, "/", job.retries)
+			self.failure(job)
 		return incident
 
 	def _getIncident( self, job, failure ):
@@ -613,7 +681,7 @@ class Queue:
 		"""Tells if there are still jobs submitted in the queue"""
 		raise Exception("Not implemented yet")
 
-	def _addJob( self, job ):
+	def _submitJob( self, job ):
 		"""Adds a new job to the queue and returns its ID (assigned by the queue)"""
 		raise Exception("Not implemented yet")
 
@@ -621,7 +689,11 @@ class Queue:
 		"""Adds an existing job to the queue and returns its ID (assigned by the queue)"""
 		raise Exception("Not implemented yet")
 
-	def _removeJob( self, job ):
+	def _completeJob( self, job ):
+		raise Exception("Not implemented yet")
+
+	def _failedJob( self, job ):
+		"""A job that has failed is archived and might be re-run later."""
 		raise Exception("Not implemented yet")
 
 
@@ -654,7 +726,7 @@ class MemoryQueue(Queue):
 				return job
 		return None
 
-	def _addJob( self, job ):
+	def _subtmiJob( self, job ):
 		"""Adds a new job to the queue and returns its ID (assigned by the queue)"""
 		# FIXME: Should be synchronized
 		self.jobs.append(job)
@@ -666,8 +738,12 @@ class MemoryQueue(Queue):
 		self.jobs.append(job)
 		return job.id
 
-	def _removeJob( self, job ):
+	def _completeJob( self, job ):
 		# NOTE: This is pretty simple, but should be optimized for big queues
+		self.jobs.remove(self._job(job))
+
+	def _failedJob( self, job ):
+		# FIXME: A different strategy might be best
 		self.jobs.remove(self._job(job))
 
 # -----------------------------------------------------------------------------
@@ -680,7 +756,14 @@ class DirectoryQueue(Queue):
 
 	# FIXME: Should use systems's directory watching
 
-	SUFFIX = ".json"
+	SUFFIX      = ".json"
+	QUEUES      = [QUEUE_INCOMING, QUEUE_PROCESSING, QUEUE_COMPLETED, QUEUE_FAILED]
+	DIRECTORIES = {
+		QUEUE_INCOMING   : QUEUE_INCOMING,
+		QUEUE_PROCESSING : QUEUE_PROCESSING,
+		QUEUE_FAILED     : QUEUE_FAILED,
+		QUEUE_COMPLETED  : QUEUE_COMPLETED
+	}
 
 	def __init__( self, path ):
 		Queue.__init__(self)
@@ -688,6 +771,10 @@ class DirectoryQueue(Queue):
 		# We create the directory if it does not exist
 		if not os.path.exists(path):
 			os.makedirs(path)
+		for queue in self.QUEUES:
+			queue_path = path + "/" + queue
+			if not os.path.exists(queue_path):
+				os.makedirs(queue_path)
 
 	def timestamp( self ):
 		now = datetime.datetime.now()
@@ -695,42 +782,34 @@ class DirectoryQueue(Queue):
 			now.year, now.month, now.day, now.hour, now.minute, now.second, now.microsecond
 		)
 
-	def _getPath( self, job ):
+	def _getPath( self, job, queue=QUEUE_INCOMING ):
 		if isinstance(job, Job): job_id = job.id
 		else: job_id = job
-		return self.path + "/" + job_id + self.SUFFIX
+		return self.path + "/" + queue + "/" + job_id + self.SUFFIX
 
-	def _listJobs( self ):
-		for _ in os.listdir(self.path):
+	def _listJobs( self, queue=QUEUE_INCOMING ):
+		for _ in os.listdir(self.path + "/" + queue):
 			if _.endswith(self.SUFFIX):
 				yield _[:-len(self.SUFFIX)]
 
 	def _getJob( self, jobID ):
 		"""Returns the job given its job id."""
-		path     = self._getPath(jobID)
-		job      = None
-		with file(path, "rb") as f:
-			job = Job.Import(json.load(f), jobID)
-		return job
+		for queue in self.QUEUES:
+			path     = self._getPath(jobID, queue)
+			if os.path.exists(path):
+				job      = None
+				with file(path, "rb") as f:
+					job = Job.Import(json.load(f), jobID)
+				return job
+		return None
 
-		with file(self._getPath(job), "wb") as f:
-			json.dump(job.export(), f)
-
-	def _addJob( self, job ):
-		"""Adds a new job to the queue and returns its ID (assigned by the queue)"""
-		new_id = self.timestamp() + "-" + job.__class__.__name__
-		job.setID(new_id)
-		with file(self._getPath(job), "wb") as f:
-			json.dump(job.export(), f)
-		return job.id
-
-	def _getNextJob( self ):
+	def _getNextJob( self, queue=QUEUE_INCOMING ):
 		"""Returns the next job and sets it as selected in this queue"""
 		iterator = self._listJobs()
 		job      = iterator.next()
 		return self._getJob(job)
 
-	def _hasJobs( self ):
+	def _hasJobs( self, queue=QUEUE_INCOMING ):
 		"""Tells if there are still jobs submitted in the queue"""
 		iterator = self._listJobs()
 		try:
@@ -739,14 +818,37 @@ class DirectoryQueue(Queue):
 		except StopIteration, e:
 			return False
 
-	def _resubmitJob( self, job ):
-		"""Adds an existing job to the queue and returns its ID (assigned by the queue)"""
-		with file(self._getPath(job), "wb") as f:
+	def _submitJob( self, job ):
+		"""Adds a new job to the queue and returns its ID (assigned by the queue)"""
+		new_id = self.timestamp() + "-" + job.__class__.__name__
+		job.setID(new_id)
+		with file(self._getPath(job, QUEUE_INCOMING), "wb") as f:
 			json.dump(job.export(), f)
 		return job.id
 
-	def _removeJob( self, job ):
-		os.unlink(self._getPath(job))
+	def _resubmitJob( self, job ):
+		"""Adds an existing job to the queue and returns its ID (assigned by the queue)"""
+		self._removeJobFile(job)
+		with file(self._getPath(job, QUEUE_INCOMING), "wb") as f:
+			json.dump(job.export(), f)
+		return job.id
+
+	def _completeJob( self, job ):
+		self._removeJobFile(job)
+		with file(self._getPath(job, QUEUE_COMPLETED), "wb") as f:
+			json.dump(job.export(), f)
+		return job.id
+
+	def _failedJob( self, job ):
+		self._removeJobFile(job)
+		with file(self._getPath(job, QUEUE_FAILED), "wb") as f:
+			json.dump(job.export(), f)
+		return job.id
+
+	def _removeJobFile( self, job ):
+		for queue in self.QUEUES:
+			path = self._getPath(job)
+			if os.path.exists(path): os.unlink(path)
 
 # -----------------------------------------------------------------------------
 #

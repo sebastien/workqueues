@@ -797,6 +797,40 @@ class DirectoryQueue(Queue):
 			if not os.path.exists(queue_path):
 				os.makedirs(queue_path)
 
+	def read( self, path, sync=True ):
+		"""Atomically read the file at the given path"""
+		flags = os.O_RDONLY
+		if sync: flags = flags | os.O_RSYNC
+		fd    = os.open(path, flags)
+		data  = None
+		try:
+			last_read = 1 
+			data      = []
+			while last_read > 0:
+				t = os.read(fd, 128000)
+				data.append(t)
+				last_read = len(t)
+			data = "".join(data)
+			os.close(fd)
+		except StandardError, e:
+			os.close(fd)
+			raise e
+		return data
+
+	def write( self, data, path, sync=True, append=False ):
+		"""Atomically write the given data in the file at the given path"""
+		flags = os.O_WRONLY | os.O_CREAT
+		if sync:       flags = flags | os.O_DSYNC
+		if not append: flags = flags | os.O_TRUNC
+		fd    = os.open(path, flags)
+		try:
+			os.write(fd, data)
+			os.close(fd)
+		except StandardError, e:
+			os.close(fd)
+			raise e
+		return self
+
 	def timestamp( self ):
 		now = datetime.datetime.now()
 		return "%04d%02d%02dT%02d:%02d%02d%d" % (
@@ -818,9 +852,8 @@ class DirectoryQueue(Queue):
 		for queue in self.QUEUES:
 			path     = self._getPath(jobID, queue)
 			if os.path.exists(path):
-				job      = None
-				with file(path, "rb") as f:
-					job = Job.Import(json.load(f), jobID)
+				job = json.loads(self.read(path))
+				job = Job.Import(job, jobID)
 				return job
 		return None
 
@@ -843,27 +876,23 @@ class DirectoryQueue(Queue):
 		"""Adds a new job to the queue and returns its ID (assigned by the queue)"""
 		new_id = self.timestamp() + "-" + job.__class__.__name__
 		job.setID(new_id)
-		with file(self._getPath(job, QUEUE_INCOMING), "wb") as f:
-			json.dump(job.export(), f)
+		self.write(asJSON(job.export()), self._getPath(job, QUEUE_INCOMING))
 		return job.id
 
 	def _resubmitJob( self, job ):
 		"""Adds an existing job to the queue and returns its ID (assigned by the queue)"""
 		self._removeJobFile(job)
-		with file(self._getPath(job, QUEUE_INCOMING), "wb") as f:
-			json.dump(job.export(), f)
+		self.write(asJSON(job.export()), self._getPath(job, QUEUE_INCOMING))
 		return job.id
 
 	def _completeJob( self, job ):
 		self._removeJobFile(job)
-		with file(self._getPath(job, QUEUE_COMPLETED), "wb") as f:
-			json.dump(job.export(), f)
+		self.write(asJSON(job.export()), self._getPath(job, QUEUE_COMPLETED))
 		return job.id
 
 	def _failedJob( self, job ):
 		self._removeJobFile(job)
-		with file(self._getPath(job, QUEUE_FAILED), "wb") as f:
-			json.dump(job.export(), f)
+		self.write(asJSON(job.export()), self._getPath(job, QUEUE_FAILED))
 		return job.id
 
 	def _removeJobFile( self, job ):

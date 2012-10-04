@@ -6,7 +6,7 @@
 # License   : Revised BSD License
 # -----------------------------------------------------------------------------
 # Creation  : 21-Jun-2012
-# Last mod  : 04-Jul-2012
+# Last mod  : 04-Oct-2012
 # -----------------------------------------------------------------------------
 
 import os, threading, subprocess, time, datetime, sys, json
@@ -15,6 +15,7 @@ try:
 except ImportError:
 	import json.dumps as     asJSON
 
+# TODO: Add Runner 1) Inline 2) Thread 3) Process 4) TMUX
 # TODO: Generator support in Job's run() to divide work?
 # TODO : Add support for storing the job's results -- queues should probably
 # have different queues: backburner (for not schedules), incoming:(to be processed),
@@ -22,6 +23,8 @@ except ImportError:
 # FIXME: Make sure that exceptions are well caught everywhere. For instance
 # DirectoryQueuw will just fail if it cannot decode the JSON
 
+__version_ = """\
+"""
 __doc__ = """\
 """
 
@@ -36,7 +39,7 @@ AS_THREAD        = "thread"
 AS_PROCESS       = "process"
 
 QUEUE_INCOMING   = "incoming"
-QUEUE_PROCESSING = "procesing"
+QUEUE_RUNNING    = "running"
 QUEUE_FAILED     = "failed"
 QUEUE_COMPLETED  = "completed"
 # States for jobs
@@ -122,9 +125,12 @@ class Result:
 		return False
 
 	def happenedAfter( self, t ):
+		print self.started, ">=", t
+		if type(t) is float: t = datetime.datetime.utcfromtimestamp(t)
 		return self.started >= t
 
 	def happenedBefore( self, t ):
+		if type(t) is float: t = datetime.datetime.utcfromtimestamp(t)
 		return self.started < t
 
 	def export( self ):
@@ -212,24 +218,24 @@ class Job:
 				return None
 
 	@classmethod
-	def Import( cls, data, jobID ):
-		job_class = cls.GetClass(data["type"])
+	def Import( cls, export, jobID=None ):
+		"""Imports a job that was previously exported."""
+		job_class = cls.GetClass(export["type"])
 		if job_class:
 			job       = job_class()
 		else:
 			job       = Job()
-			job.isUnresolved = data
-		job.id  = jobID
-		for _ in ["timeout", "scheduled", "submitted", "until", "frequency", "repeat", "id", "retries", "lastRun"]:
-			if data.has_key(_):
-				setattr(job, _, data[_])
-		if data.get("result"):
-			result_json = data["result"]
+			job.isUnresolved = export
+		for _ in ["timeout", "scheduled", "submitted", "until", "frequency", "repeat", "id", "retries", "lastRun", "type"]:
+			if export.has_key(_):
+				setattr(job, _, export[_])
+		if jobID: job.id  = jobID
+		if export.get("result"):
+			result_json = export["result"]
 			result = Result.Import(result_json)
 			job.result = result
-		for _ in data["data"]:
-			if data["data"].has_key(_):
-				setattr(job, _, data["data"][_])
+		for _,v in export["data"].items():
+			setattr(job, _, v)
 		return job
 
 	def __init__( self, env=None ):
@@ -244,6 +250,7 @@ class Job:
 		self.lastRun      = -1
 		self.env          = env
 		self.isUnresolved = False
+		self.type         = self.__class__.__module__ + "." + self.__class__.__name__.split(".")[-1]
 		self.result       = None
 		assert "id" not in self.DATA, "DATA does not allow an 'id' attribute"
 
@@ -285,13 +292,26 @@ class Job:
 		"""The main Job function that you'll override when implementing the Job"""
 		raise Exception("Job.run not implemented")
 
+	def shell( self, command, cwd="." ):
+		if type(command) in (tuple, list): command = " ".join(command)
+		cmd      = subprocess.Popen(command, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, cwd=cwd, env=dict(LANG="C"))
+		status   = cmd.wait()
+		res, err = cmd.communicate()
+		if status == 0:
+			return res
+		else:
+			return err
+
 	def export( self ):
+		# If the job is unresolved, then we export the same data that was
+		# imported
+		if self.isUnresolved: return self.isUnresolved
 		data = {}
 		result_export = None
 		if self.result:
 			result_export = self.result.export()
 		base = dict(
-			type      = self.__class__.__module__ + "." + self.__class__.__name__.split(".")[-1],
+			type      = self.type,
 			timeout   = self.timeout,
 			scheduled = self.scheduled,
 			until     = self.until,
@@ -553,6 +573,10 @@ class Queue:
 		"""Executes periodic cleaning up operations on the queue"""
 		self.incidents    = filter(lambda _:_.clean(), self.incidents)
 		self.lastCleanup = time.time()
+	
+	def clear( self ):
+		"""Clears all the jobs from the queue"""
+		map(self._removeJob, self.list())
 
 	def submit( self, job ):
 		"""Submit a new job or a list of jobs in this queue"""
@@ -717,6 +741,10 @@ class Queue:
 		"""A job that has failed is archived and might be re-run later."""
 		raise Exception("Not implemented yet")
 
+	def _removeJob( self, job ):
+		"""Removes a job from the queue, permanently"""
+		raise Exception("Not implemented yet")
+
 
 # -----------------------------------------------------------------------------
 #
@@ -747,7 +775,7 @@ class MemoryQueue(Queue):
 				return job
 		return None
 
-	def _subtmiJob( self, job ):
+	def _submitJob( self, job ):
 		"""Adds a new job to the queue and returns its ID (assigned by the queue)"""
 		# FIXME: Should be synchronized
 		self.jobs.append(job)
@@ -778,10 +806,10 @@ class DirectoryQueue(Queue):
 	# FIXME: Should use systems's directory watching
 
 	SUFFIX      = ".json"
-	QUEUES      = [QUEUE_INCOMING, QUEUE_PROCESSING, QUEUE_COMPLETED, QUEUE_FAILED]
+	QUEUES      = [QUEUE_INCOMING, QUEUE_RUNNING, QUEUE_COMPLETED, QUEUE_FAILED]
 	DIRECTORIES = {
 		QUEUE_INCOMING   : QUEUE_INCOMING,
-		QUEUE_PROCESSING : QUEUE_PROCESSING,
+		QUEUE_RUNNING    : QUEUE_RUNNING,
 		QUEUE_FAILED     : QUEUE_FAILED,
 		QUEUE_COMPLETED  : QUEUE_COMPLETED
 	}
@@ -895,10 +923,13 @@ class DirectoryQueue(Queue):
 		self.write(asJSON(job.export()), self._getPath(job, QUEUE_FAILED))
 		return job.id
 
+	def _removeJob( self, job ):
+		self._removeJobFile(job)
+
 	def _removeJobFile( self, job ):
-		for queue in self.QUEUES:
-			path = self._getPath(job)
-			if os.path.exists(path): os.unlink(path)
+		"""Physically removes the job file."""
+		path = self._getPath(job)
+		if os.path.exists(path): os.unlink(path)
 
 # -----------------------------------------------------------------------------
 #

@@ -9,7 +9,8 @@
 # Last mod  : 04-Oct-2012
 # -----------------------------------------------------------------------------
 
-import os, threading, subprocess, time, datetime, sys, json
+import os, threading, subprocess, time, datetime, sys, json, traceback
+import cStringIO as StringIO
 try:
 	from   retro.core import asJSON
 except ImportError:
@@ -21,11 +22,10 @@ except ImportError:
 # have different queues: backburner (for not schedules), incoming:(to be processed),
 # processing(being processed), failed:(jobs failed and permanently removed), completed:(completed)
 # FIXME: Make sure that exceptions are well caught everywhere. For instance
-# DirectoryQueuw will just fail if it cannot decode the JSON
+# DirectoryQueue will just fail if it cannot decode the JSON
 
-__version_ = """\
-"""
-__doc__ = """\
+__version_ = "0.0.1"
+__doc__    = """\
 """
 
 # Hooks for custom logging functions
@@ -160,7 +160,7 @@ class Failure(Result):
 		return True
 
 	def __str__(self):
-		res = "%s:%s" % (self.__class__.__name__, self.description)
+		res = "%s:<%s>" % (self.__class__.__name__, self.description)
 		if self.value: res += " (%s)"     % (self.value)
 		if self.job:   res += " in %s:%s" % (self.job.__class__.__name__, self.job.id)
 		return res
@@ -208,6 +208,10 @@ class Job:
 
 	@classmethod
 	def GetClass( cls, name ):
+		# NOTE: Here, we could simply use `eval` os even sys.modules to resolve
+		# the class, but by doing this we rely on explicit job registration.
+		# The main reason is that jobs might be insecure, so we want to limit
+		# the possibility to execute arbitrary code.
 		if JOB_CLASSES.has_key(name):
 			return JOB_CLASSES[name]
 		else:
@@ -248,11 +252,15 @@ class Job:
 		self.id           = None
 		self.retries      = 0
 		self.lastRun      = -1
+		self.progress     = -1
 		self.env          = env
 		self.isUnresolved = False
 		self.type         = self.__class__.__module__ + "." + self.__class__.__name__.split(".")[-1]
 		self.result       = None
 		assert "id" not in self.DATA, "DATA does not allow an 'id' attribute"
+
+	def updateProgress( self, progress ):
+		self.progress = progress
 
 	def isComplete( self ):
 		return self.result and isinstance(self.result, Success)
@@ -324,10 +332,12 @@ class Job:
 		return base
 	
 	def __str__( self ):
+		data = asJSON(self.export()["data"])
+		if len(data) > 80: data = data[:77] + "..."
 		if self.isUnresolved:
-			return "%s[UNRESOLVED](%s):%s" % (self.isUnresolved["type"], self.id, asJSON(self.isUnresolved["data"]))
+			return "%s[UNRESOLVED](%s):%s" % (self.isUnresolved["type"], self.id, data)
 		else:
-			return "%s(%s):%s" % (self.__class__.__name__, self.id, asJSON(self.export()["data"]))
+			return "%s(%s):%s" % (self.__class__.__name__, self.id, data)
 
 # -----------------------------------------------------------------------------
 #
@@ -388,7 +398,10 @@ class Worker:
 		try:
 			result = Success(job.run())
 		except Exception, e:
-			result = Failure(e, job=job)
+			error_msg = StringIO.StringIO()
+			traceback.print_exc(file=error_msg)
+			error_msg = error_msg.getvalue()
+			result = Failure(error_msg, job=job)
 		self._setResultTime(result, start_time)
 		# We have to put the doJobEnd here, as callbacks might fail or 
 		# take too long
@@ -414,12 +427,15 @@ class Pool:
 	"""Pools are used to limit the number of elements (workers executing)
 	at once."""
 
-	def __init__(self, capacity):
-		self.capacity   = capacity
-		self._semaphore = threading.BoundedSemaphore(self.capacity)
+	def __init__(self, capacity=5):
+		"""Creates a default pool with the given capacity (5 by default)"""
+		self.capacity     = capacity
+		self._semaphore   = threading.BoundedSemaphore(self.capacity)
 		self._workersCount = 0
 
 	def submit(self, job, block=False):
+		"""Submits a job to the pool. This will create a worker and
+		assign the job to the worker."""
 		if self.canAdd() or block:
 			# NOTE: This is only blocking if canAdd is False
 			self._semaphore.acquire()
@@ -439,6 +455,7 @@ class Pool:
 		return self.count() < self.capacity
 
 	def count(self):
+		"""Returns the number of workers in the queue"""
 		return self._workersCount
 
 # -----------------------------------------------------------------------------
@@ -560,7 +577,7 @@ class Queue:
 	CLEANUP_PERIOD = 60 * 5
 
 	def __init__( self ):
-		self.pool      = None
+		self.pool      = Pool()
 		self.jobs      = []
 		self.incidents = []
 		self._lastSelected = -1
@@ -568,7 +585,7 @@ class Queue:
 
 	def setPool( self, pool ):
 		self.pool = pool
-
+	
 	def clean( self ):
 		"""Executes periodic cleaning up operations on the queue"""
 		self.incidents    = filter(lambda _:_.clean(), self.incidents)
@@ -624,17 +641,19 @@ class Queue:
 			# ...if not, we return the time we have to wait up until the next event
 			# Makes sure the pool can process the event
 			# ...if not, we return the maximum time in which the pool will be free/or a callback to when the pool will be free
-			log(self.__class__.__name__, "SUBMIT   ", job)
+			log(self.__class__.__name__, "SUBMIT     ", job)
 			if not job.isUnresolved:
+				if not self.pool:
+					raise Exception("Workqueue has no associated worker pool (see `setPool`)")
 				worker = self.pool.submit(job, block=True)
 				# Now we have the worker and we ask it to run the job
-				log(self.__class__.__name__, "RUNNING  ", job)
+				log(self.__class__.__name__, "RUNNING    ", job)
 				result = worker.run()
 			else:
-				log(self.__class__.__name__, "UNKNOWN  ", job)
+				err(self.__class__.__name__, "UNRESOLVED ", job)
 				result  = Failure("Unresolved job")
 			if   isinstance(result, Success):
-				log(self.__class__.__name__, "SUCCESS  ", job, ":", result)
+				log(self.__class__.__name__, "SUCCESS    ", job, ":", result)
 				job.retries = 0
 				# the job is successfully processed
 				self._onJobSucceeded(job, result)
@@ -674,16 +693,16 @@ class Queue:
 		if incident.isAboveThreshold():
 			# If the incident is above threshold, we won't retry the job,
 			# as it's likely to fail again
-			warn(self.__class__.__name__, "!INCIDENT", job.id, ":", incident)
+			warn(self.__class__.__name__, "!INCIDENT", job.id, ":", incident, "with", failure)
 			self.failure(job)
 		elif job.canRetry():
 			# If the incident is not above threshold, and the job has not
 			# reached its retry count, we resubmit it
-			warn(self.__class__.__name__, "!RESUBMIT", job.id, "/", job.retries)
+			warn(self.__class__.__name__, "!RESUBMIT", job.id, "/", job.retries, "because of", failure)
 			self.resubmit(job)
 		else:
 			# Otherwise we remove the job from the queue
-			warn(self.__class__.__name__, "!MAXRETRY", job.id, "/", job.retries)
+			warn(self.__class__.__name__, "!MAXRETRY", job.id, "/", job.retries, "after", failure)
 			self.failure(job)
 		return incident
 

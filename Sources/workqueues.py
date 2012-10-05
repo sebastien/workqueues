@@ -6,7 +6,7 @@
 # License   : Revised BSD License
 # -----------------------------------------------------------------------------
 # Creation  : 21-Jun-2012
-# Last mod  : 04-Oct-2012
+# Last mod  : 05-Oct-2012
 # -----------------------------------------------------------------------------
 
 import os, threading, subprocess, time, datetime, sys, json, traceback
@@ -24,7 +24,7 @@ except ImportError:
 # FIXME: Make sure that exceptions are well caught everywhere. For instance
 # DirectoryQueue will just fail if it cannot decode the JSON
 
-__version_ = "0.0.1"
+__version_ = "0.5.0"
 __doc__    = """\
 """
 
@@ -60,10 +60,9 @@ JOB_COMPLETED    = "completed"
 JOB_FAILED       = "completed"
 JOB_CLASSES      = {}
 
-def timestamp(t=None):
+def timestamp():
 	"""Returns the current time as an UTC timestamp in seconds"""
-	if t is None: t = time.time()
-	return datetime.datetime.utcfromtimestamp(t)
+	return time.time() - time.timezone
 
 # -----------------------------------------------------------------------------
 #
@@ -125,12 +124,11 @@ class Result:
 		return False
 
 	def happenedAfter( self, t ):
-		print self.started, ">=", t
-		if type(t) is float: t = datetime.datetime.utcfromtimestamp(t)
+		assert type(t) is float, "The given time should be given in seconds since UTC"
 		return self.started >= t
 
 	def happenedBefore( self, t ):
-		if type(t) is float: t = datetime.datetime.utcfromtimestamp(t)
+		assert type(t) is float, "The given time should be given in seconds since UTC"
 		return self.started < t
 
 	def export( self ):
@@ -673,9 +671,12 @@ class Queue:
 			yield result
 
 	def run( self, count=-1 ):
+		"""Runs the workqueue for `count` interations, stopping when
+		no more job is available."""
 		iteration = 0
 		for result in self.iterate(count):
 			iteration += 1
+		return iteration
 
 	def _updateJobStatus( self, jobOrJobID, status ):
 		"""Updates the status of this job."""
@@ -976,5 +977,29 @@ class ZMQueue(Queue):
 
 class HTTPQueue(Queue):
 	pass
+
+# -----------------------------------------------------------------------------
+#
+# DAEMON
+#
+# -----------------------------------------------------------------------------
+
+class Daemon:
+	"""A very simple class that wraps a queue and runs it, sleep and waking
+	up every second to check for more work."""
+
+	def __init__( self, queue=None, period=1 ):
+		self.queue       = None
+		self.isRunning   = False
+		self.sleepPeriod = period
+	
+	def run( self ):
+		self.isRunning = True
+		while self.isRunning:
+			if self.queue.run(1) == 0:
+				time.sleep(self.sleepPeriod)
+	
+	def stop( self ):
+		self.isRunning = False
 
 # EOF - vim: tw=80 ts=4 sw=4 noet

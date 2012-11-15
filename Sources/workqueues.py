@@ -6,7 +6,7 @@
 # License   : Revised BSD License
 # -----------------------------------------------------------------------------
 # Creation  : 21-Jun-2012
-# Last mod  : 05-Oct-2012
+# Last mod  : 15-Nov-2012
 # -----------------------------------------------------------------------------
 
 import os, threading, subprocess, time, datetime, sys, json, traceback
@@ -24,7 +24,7 @@ except ImportError:
 # FIXME: Make sure that exceptions are well caught everywhere. For instance
 # DirectoryQueue will just fail if it cannot decode the JSON
 
-__version_ = "0.5.0"
+__version_ = "0.6.0"
 __doc__    = """\
 """
 
@@ -39,7 +39,7 @@ AS_THREAD        = "thread"
 AS_PROCESS       = "process"
 
 QUEUE_INCOMING   = "incoming"
-QUEUE_RUNNING    = "running"
+QUEUE_IN_PROCESS = "running"
 QUEUE_FAILED     = "failed"
 QUEUE_COMPLETED  = "completed"
 # States for jobs
@@ -54,10 +54,10 @@ QUEUE_COMPLETED  = "completed"
 
 JOB_SUBMITTED    = "submitted"
 JOB_RESUBMITTED  = "resubmitted"
-JOB_SELECTED     = "selected"
 JOB_IN_PROCESS   = "inprocess"
 JOB_COMPLETED    = "completed"
-JOB_FAILED       = "completed"
+JOB_FAILED       = "failed"
+JOB_REMOVED      = "removed"
 JOB_CLASSES      = {}
 
 def timestamp():
@@ -228,7 +228,8 @@ class Job:
 		else:
 			job       = Job()
 			job.isUnresolved = export
-		for _ in ["timeout", "scheduled", "submitted", "until", "frequency", "repeat", "id", "retries", "lastRun", "type"]:
+		# NOTE: The following list is the list of all the Job's properties
+		for _ in ["timeout", "scheduled", "submitted", "until", "frequency", "repeat", "id", "retries", "lastRun", "type", "status"]:
 			if export.has_key(_):
 				setattr(job, _, export[_])
 		if jobID: job.id  = jobID
@@ -254,8 +255,12 @@ class Job:
 		self.env          = env
 		self.isUnresolved = False
 		self.type         = self.__class__.__module__ + "." + self.__class__.__name__.split(".")[-1]
+		self.status       = None
 		self.result       = None
 		assert "id" not in self.DATA, "DATA does not allow an 'id' attribute"
+
+	def setStatus( self, status ):
+		self.status = status
 
 	def updateProgress( self, progress ):
 		self.progress = progress
@@ -324,6 +329,7 @@ class Job:
 			frequency = self.frequency,
 			repeat    = self.repeat,
 			data      = data,
+			status    = self.status,
 			result    = result_export
 		)
 		for field in self.DATA: data[field] = getattr(self, field)
@@ -568,6 +574,8 @@ class Incident:
 # -----------------------------------------------------------------------------
 
 class Queue:
+	"""The queue is the main interfact you use to submit, query and manipulate
+	jobs."""
 
 	# FIXME: Add support for that
 	MAX_JOBS       = 128000
@@ -579,19 +587,23 @@ class Queue:
 		self.jobs      = []
 		self.incidents = []
 		self._lastSelected = -1
-		self.lastCleanup = -1
+		self.lastClean     = -1
 
 	def setPool( self, pool ):
+		"""Sets the job pool to be used"""
+		# NOTE: Shouldn't we do something with the existing pool if jobs
+		# are currently running?
 		self.pool = pool
 	
 	def clean( self ):
 		"""Executes periodic cleaning up operations on the queue"""
-		self.incidents    = filter(lambda _:_.clean(), self.incidents)
-		self.lastCleanup = time.time()
-	
+		# FIXME: WHat should be done here?
+		self.lastClean = time.time()
+
 	def clear( self ):
-		"""Clears all the jobs from the queue"""
+		"""Clears all the jobs and incidents from the queue"""
 		map(self._removeJob, self.list())
+		self.incidents = []
 
 	def submit( self, job ):
 		"""Submit a new job or a list of jobs in this queue"""
@@ -599,27 +611,68 @@ class Queue:
 			return map(self.submit, job)
 		else:
 			job.submitted = timestamp ()
+			job.setStatus(JOB_SUBMITTED)
 			return self._submitJob(job)
+
+	def process( self, jobOrID):
+		"""Processes the given job. This will mark it as in process and
+		run it"""
+		job = self._job(jobOrID)
+		job.setStatus(JOB_IN_PROCESS)
+		self._processJob(job)
+		return self._runJob(job)
+	
+	def _runJob( self, job ):
+		# Makes sure it's time to execute it
+		# ...if not, we return the time we have to wait up until the next event
+		# Makes sure the pool can process the event
+		# ...if not, we return the maximum time in which the pool will be free/or a callback to when the pool will be free
+		if not job.isUnresolved:
+			if not self.pool:
+				raise Exception("Workqueue has no associated worker pool (see `setPool`)")
+			worker = self.pool.submit(job, block=True)
+			# Now we have the worker and we ask it to run the job
+			log(self.__class__.__name__, "IN PROCESS ", job)
+			result = worker.run()
+		else:
+			err(self.__class__.__name__, "UNRESOLVED ", job)
+			result  = Failure("Unresolved job")
+		if   isinstance(result, Success):
+			log(self.__class__.__name__, "SUCCESS    ", job, ":", result)
+			job.retries = 0
+			# the job is successfully processed
+			self._onJobSucceeded(job, result)
+		elif isinstance(result, Failure):
+			self._onJobFailed(job, result)
+		else:
+			self._onJobFailed(job, UnexpectedResult(result))
+		return result
 
 	def resubmit( self, job ):
 		assert job.id != None, "You cannot resumbit a job without an id: %s" % (job)
 		# We increase the number of retries in the job
 		job.retries += 1
-		self._updateJobStatus(job, JOB_RESUBMITTED)
+		self.setStatus(JOB_RESUBMITTED)
 		self._resubmitJob(job)
 	
 	def failure( self, job ):
 		"""Removes the job from the queue after too many failures"""
 		assert job.id != None
-		self._updateJobStatus(job, JOB_FAILED)
+		self.setStatus(JOB_FAILED)
 		self._failedJob(job)
 		return job
 
 	def complete( self, job ):
 		"""Removes the job from the queue"""
 		assert job.id != None
-		self._updateJobStatus(job, JOB_COMPLETED)
+		self.setStatus(JOB_COMPLETED)
 		self._completeJob(job)
+		return job
+
+	def remove( self, job ):
+		"""Removes the job from the queue"""
+		self.setStatus(JOB_REMOVED)
+		self._removeJob(job)
 		return job
 
 	def list( self, until=None, since=None, status=None, queue=None ):
@@ -630,43 +683,21 @@ class Queue:
 		"""Returns the Job instance with the given ID"""
 		return self._getJob(jobID)
 
+
 	def iterate( self, count=-1 ):
 		while (count == -1 or count > 0) and self._hasJobs():
 			# Takes the next available job
 			job = self._getNextJob()
-			self._updateJobStatus(job, JOB_SELECTED)
-			# Makes sure it's time to execute it
-			# ...if not, we return the time we have to wait up until the next event
-			# Makes sure the pool can process the event
-			# ...if not, we return the maximum time in which the pool will be free/or a callback to when the pool will be free
 			log(self.__class__.__name__, "SUBMIT     ", job)
-			if not job.isUnresolved:
-				if not self.pool:
-					raise Exception("Workqueue has no associated worker pool (see `setPool`)")
-				worker = self.pool.submit(job, block=True)
-				# Now we have the worker and we ask it to run the job
-				log(self.__class__.__name__, "RUNNING    ", job)
-				result = worker.run()
-			else:
-				err(self.__class__.__name__, "UNRESOLVED ", job)
-				result  = Failure("Unresolved job")
-			if   isinstance(result, Success):
-				log(self.__class__.__name__, "SUCCESS    ", job, ":", result)
-				job.retries = 0
-				# the job is successfully processed
-				self._onJobSucceeded(job, result)
-			elif isinstance(result, Failure):
-				self._onJobFailed(job, result)
-			else:
-				self._onJobFailed(job, UnexpectedResult(result))
+			result = self.process(job)
 			if count > 0: count -= 1
 			# Takes care of cleaning up the queue if it's necessary
 			now = time.time()
-			if self.lastCleanup == -1:
-				self.lastCleanup = now
-			elif (self.lastCleanup - now) > self.CLEANUP_PERIOD:
-				self.cleanup()
-				self.lastCleanup = now
+			if self.lastClean == -1:
+				self.lastClean = now
+			elif (self.lastClean - now) > self.CLEANUP_PERIOD:
+				self.clean()
+				self.lastClean = now
 			# And finally returns the result
 			yield result
 
@@ -678,13 +709,9 @@ class Queue:
 			iteration += 1
 		return iteration
 
-	def _updateJobStatus( self, jobOrJobID, status ):
-		"""Updates the status of this job."""
-		# FIXME: Implement me
-
 	def _onJobSucceeded( self, jobOrJobID, result ):
 		job = self._job(jobOrJobID)
-		self._updateJobStatus( jobOrJobID, JOB_COMPLETED )
+		job.setStatus(JOB_COMPLETED)
 		self._completeJob(job)
 
 	def _onJobFailed( self, job, failure ):
@@ -748,6 +775,10 @@ class Queue:
 
 	def _submitJob( self, job ):
 		"""Adds a new job to the queue and returns its ID (assigned by the queue)"""
+		raise Exception("Not implemented yet")
+
+	def _processJob( self, job ):
+		"""A job is being processed."""
 		raise Exception("Not implemented yet")
 
 	def _resubmitJob( self, job ):
@@ -826,10 +857,10 @@ class DirectoryQueue(Queue):
 	# FIXME: Should use systems's directory watching
 
 	SUFFIX      = ".json"
-	QUEUES      = [QUEUE_INCOMING, QUEUE_RUNNING, QUEUE_COMPLETED, QUEUE_FAILED]
+	QUEUES      = [QUEUE_INCOMING, QUEUE_IN_PROCESS, QUEUE_COMPLETED, QUEUE_FAILED]
 	DIRECTORIES = {
 		QUEUE_INCOMING   : QUEUE_INCOMING,
-		QUEUE_RUNNING    : QUEUE_RUNNING,
+		QUEUE_IN_PROCESS : QUEUE_IN_PROCESS,
 		QUEUE_FAILED     : QUEUE_FAILED,
 		QUEUE_COMPLETED  : QUEUE_COMPLETED
 	}
@@ -927,6 +958,18 @@ class DirectoryQueue(Queue):
 		self.write(asJSON(job.export()), self._getPath(job, QUEUE_INCOMING))
 		return job.id
 
+	def _processJob( self, job ):
+		self._removeJobFile(job)
+		self.write(asJSON(job.export()), self._getPath(job, QUEUE_IN_PROCESS))
+		return job.id
+
+	def _submitJob( self, job ):
+		"""Adds a new job to the queue and returns its ID (assigned by the queue)"""
+		new_id = self.timestamp() + "-" + job.__class__.__name__
+		job.setID(new_id)
+		self.write(asJSON(job.export()), self._getPath(job, QUEUE_INCOMING))
+		return job.id
+
 	def _resubmitJob( self, job ):
 		"""Adds an existing job to the queue and returns its ID (assigned by the queue)"""
 		self._removeJobFile(job)
@@ -989,14 +1032,14 @@ class Daemon:
 	up every second to check for more work."""
 
 	def __init__( self, queue=None, period=1 ):
-		self.queue       = None
+		self.queue       = queue
 		self.isRunning   = False
 		self.sleepPeriod = period
 	
 	def run( self ):
 		self.isRunning = True
 		while self.isRunning:
-			if self.queue.run(1) == 0:
+			if self.queue.run(1) == 0 and self.isRunning:
 				time.sleep(self.sleepPeriod)
 	
 	def stop( self ):

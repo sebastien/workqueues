@@ -6,7 +6,7 @@
 # License   : Revised BSD License
 # -----------------------------------------------------------------------------
 # Creation  : 21-Jun-2012
-# Last mod  : 15-Nov-2012
+# Last mod  : 19-Nov-2012
 # -----------------------------------------------------------------------------
 
 import os, threading, subprocess, time, datetime, sys, json, traceback
@@ -24,7 +24,7 @@ except ImportError:
 # FIXME: Make sure that exceptions are well caught everywhere. For instance
 # DirectoryQueue will just fail if it cannot decode the JSON
 
-__version_ = "0.6.0"
+__version_ = "0.7.0"
 __doc__    = """\
 """
 
@@ -38,10 +38,6 @@ AS_FUNCTION      = "function"
 AS_THREAD        = "thread"
 AS_PROCESS       = "process"
 
-QUEUE_INCOMING   = "incoming"
-QUEUE_IN_PROCESS = "running"
-QUEUE_FAILED     = "failed"
-QUEUE_COMPLETED  = "completed"
 # States for jobs
 # JOB:
 # 
@@ -260,7 +256,9 @@ class Job:
 		assert "id" not in self.DATA, "DATA does not allow an 'id' attribute"
 
 	def setStatus( self, status ):
+		old_status  = self.status
 		self.status = status
+		return old_status
 
 	def updateProgress( self, progress ):
 		self.progress = progress
@@ -611,15 +609,14 @@ class Queue:
 			return map(self.submit, job)
 		else:
 			job.submitted = timestamp ()
-			job.setStatus(JOB_SUBMITTED)
-			return self._submitJob(job)
+			self._submitJob(job, job.setStatus(JOB_SUBMITTED))
+			return job
 
 	def process( self, jobOrID):
 		"""Processes the given job. This will mark it as in process and
 		run it"""
 		job = self._job(jobOrID)
-		job.setStatus(JOB_IN_PROCESS)
-		self._processJob(job)
+		self._processJob(job, job.setStatus(JOB_IN_PROCESS))
 		return self._runJob(job)
 	
 	def _runJob( self, job ):
@@ -633,7 +630,11 @@ class Queue:
 			worker = self.pool.submit(job, block=True)
 			# Now we have the worker and we ask it to run the job
 			log(self.__class__.__name__, "IN PROCESS ", job)
-			result = worker.run()
+			try:
+				result = worker.run()
+			except Exception, e:
+				err(self.__class__.__name, "EXCEPTION while running job", job, ":", e)
+				result = Failure(str(e), value=e, job=job)
 		else:
 			err(self.__class__.__name__, "UNRESOLVED ", job)
 			result  = Failure("Unresolved job")
@@ -652,27 +653,25 @@ class Queue:
 		assert job.id != None, "You cannot resumbit a job without an id: %s" % (job)
 		# We increase the number of retries in the job
 		job.retries += 1
-		self.setStatus(JOB_RESUBMITTED)
-		self._resubmitJob(job)
+		self._resubmitJob(job, job.setStatus(JOB_RESUBMITTED))
+		return job
 	
 	def failure( self, job ):
 		"""Removes the job from the queue after too many failures"""
 		assert job.id != None
-		self.setStatus(JOB_FAILED)
-		self._failedJob(job)
+		self._failedJob(job, self.setStatus(JOB_FAILED))
 		return job
 
-	def complete( self, job ):
+	def complete( self, jobOrJobID ):
 		"""Removes the job from the queue"""
+		job = self._getJob(jobOrJobID)
 		assert job.id != None
-		self.setStatus(JOB_COMPLETED)
-		self._completeJob(job)
+		self._completeJob(job, job.setStatus(JOB_COMPLETED))
 		return job
 
 	def remove( self, job ):
 		"""Removes the job from the queue"""
-		self.setStatus(JOB_REMOVED)
-		self._removeJob(job)
+		self._removeJob(job, self.setStatus(JOB_REMOVED))
 		return job
 
 	def list( self, until=None, since=None, status=None, queue=None ):
@@ -682,7 +681,6 @@ class Queue:
 	def get( self, jobID ):
 		"""Returns the Job instance with the given ID"""
 		return self._getJob(jobID)
-
 
 	def iterate( self, count=-1 ):
 		while (count == -1 or count > 0) and self._hasJobs():
@@ -710,9 +708,10 @@ class Queue:
 		return iteration
 
 	def _onJobSucceeded( self, jobOrJobID, result ):
+		print "ON JOB SUCEEDDE", jobOrJobID
 		job = self._job(jobOrJobID)
-		job.setStatus(JOB_COMPLETED)
-		self._completeJob(job)
+		print "COMPLETING JOB", job
+		self.complete(job)
 
 	def _onJobFailed( self, job, failure ):
 		"""Called when a job has failed."""
@@ -773,26 +772,26 @@ class Queue:
 		"""Tells if there are still jobs submitted in the queue"""
 		raise Exception("Not implemented yet")
 
-	def _submitJob( self, job ):
+	def _submitJob( self, job, previousStatus ):
 		"""Adds a new job to the queue and returns its ID (assigned by the queue)"""
 		raise Exception("Not implemented yet")
 
-	def _processJob( self, job ):
+	def _processJob( self, job, previousStatus ):
 		"""A job is being processed."""
 		raise Exception("Not implemented yet")
 
-	def _resubmitJob( self, job ):
+	def _resubmitJob( self, job, previousStatus ):
 		"""Adds an existing job to the queue and returns its ID (assigned by the queue)"""
 		raise Exception("Not implemented yet")
 
-	def _completeJob( self, job ):
+	def _completeJob( self, job, previousStatus ):
 		raise Exception("Not implemented yet")
 
-	def _failedJob( self, job ):
+	def _failedJob( self, job, previousStatus ):
 		"""A job that has failed is archived and might be re-run later."""
 		raise Exception("Not implemented yet")
 
-	def _removeJob( self, job ):
+	def _removeJob( self, job, previousStatus ):
 		"""Removes a job from the queue, permanently"""
 		raise Exception("Not implemented yet")
 
@@ -826,23 +825,23 @@ class MemoryQueue(Queue):
 				return job
 		return None
 
-	def _submitJob( self, job ):
+	def _submitJob( self, job, previousStatus ):
 		"""Adds a new job to the queue and returns its ID (assigned by the queue)"""
 		# FIXME: Should be synchronized
 		self.jobs.append(job)
 		return job.setID("%s@%s" % (len(self.jobs) - 1, time.time())).id
 
-	def _resubmitJob( self, job ):
+	def _resubmitJob( self, job, previousStatus ):
 		"""Adds an existing job to the queue and returns its ID (assigned by the queue)"""
 		# FIXME: Should be synchronized
 		self.jobs.append(job)
 		return job.id
 
-	def _completeJob( self, job ):
+	def _completeJob( self, job, previousStatus ):
 		# NOTE: This is pretty simple, but should be optimized for big queues
 		self.jobs.remove(self._job(job))
 
-	def _failedJob( self, job ):
+	def _failedJob( self, job, previousStatus ):
 		# FIXME: A different strategy might be best
 		self.jobs.remove(self._job(job))
 
@@ -857,12 +856,13 @@ class DirectoryQueue(Queue):
 	# FIXME: Should use systems's directory watching
 
 	SUFFIX      = ".json"
-	QUEUES      = [QUEUE_INCOMING, QUEUE_IN_PROCESS, QUEUE_COMPLETED, QUEUE_FAILED]
-	DIRECTORIES = {
-		QUEUE_INCOMING   : QUEUE_INCOMING,
-		QUEUE_IN_PROCESS : QUEUE_IN_PROCESS,
-		QUEUE_FAILED     : QUEUE_FAILED,
-		QUEUE_COMPLETED  : QUEUE_COMPLETED
+	QUEUES      = {
+		JOB_SUBMITTED    : "incoming",
+		JOB_RESUBMITTED  : "incoming",
+		JOB_IN_PROCESS   : "running",
+		JOB_COMPLETED    : "completed",
+		JOB_FAILED       : "failed",
+		JOB_REMOVED      : "removed",
 	}
 
 	def __init__( self, path ):
@@ -871,7 +871,7 @@ class DirectoryQueue(Queue):
 		# We create the directory if it does not exist
 		if not os.path.exists(path):
 			os.makedirs(path)
-		for queue in self.QUEUES:
+		for queue in self.QUEUES.values():
 			queue_path = path + "/" + queue
 			if not os.path.exists(queue_path):
 				os.makedirs(queue_path)
@@ -916,83 +916,104 @@ class DirectoryQueue(Queue):
 			now.year, now.month, now.day, now.hour, now.minute, now.second, now.microsecond
 		)
 
-	def _getPath( self, job, queue=QUEUE_INCOMING ):
-		if isinstance(job, Job): job_id = job.id
-		else: job_id = job
-		return self.path + "/" + queue + "/" + job_id + self.SUFFIX
-
-	def _listJobs( self, queue=QUEUE_INCOMING ):
-		for _ in os.listdir(self.path + "/" + queue):
+	def _listJobs( self, status=JOB_SUBMITTED ):
+		for _ in os.listdir(self.path + "/" + self.QUEUES[status]):
 			if _.endswith(self.SUFFIX):
 				yield _[:-len(self.SUFFIX)]
 
-	def _getJob( self, jobID ):
-		"""Returns the job given its job id."""
-		for queue in self.QUEUES:
-			path     = self._getPath(jobID, queue)
-			if os.path.exists(path):
-				job = json.loads(self.read(path))
-				job = Job.Import(job, jobID)
-				return job
-		return None
-
-	def _getNextJob( self, queue=QUEUE_INCOMING ):
+	def _getNextJob( self, status=JOB_SUBMITTED ):
 		"""Returns the next job and sets it as selected in this queue"""
-		iterator = self._listJobs()
+		iterator = self._listJobs(status)
 		job      = iterator.next()
 		return self._getJob(job)
 
-	def _hasJobs( self, queue=QUEUE_INCOMING ):
+	def _hasJobs( self, status=JOB_SUBMITTED ):
 		"""Tells if there are still jobs submitted in the queue"""
-		iterator = self._listJobs()
+		# NOTE: JOB_SUBMITTED and JOB_RESUBMITTED are the same keys, so it's
+		# OK to do just that
+		iterator = self._listJobs(status)
 		try:
 			iterator.next()
 			return True
 		except StopIteration, e:
 			return False
 
-	def _submitJob( self, job ):
+	def _submitJob( self, job, previousStatus ):
 		"""Adds a new job to the queue and returns its ID (assigned by the queue)"""
 		new_id = self.timestamp() + "-" + job.__class__.__name__
 		job.setID(new_id)
-		self.write(asJSON(job.export()), self._getPath(job, QUEUE_INCOMING))
+		self.write(asJSON(job.export()), self._getPath(job))
 		return job.id
 
-	def _processJob( self, job ):
-		self._removeJobFile(job)
-		self.write(asJSON(job.export()), self._getPath(job, QUEUE_IN_PROCESS))
+	def _processJob( self, job, previousStatus ):
+		print "PROCESSING JOB", job, self._getPath(job)
+		self._removeJobFile(job, previousStatus)
+		self.write(asJSON(job.export()), self._getPath(job))
 		return job.id
 
-	def _submitJob( self, job ):
-		"""Adds a new job to the queue and returns its ID (assigned by the queue)"""
-		new_id = self.timestamp() + "-" + job.__class__.__name__
-		job.setID(new_id)
-		self.write(asJSON(job.export()), self._getPath(job, QUEUE_INCOMING))
-		return job.id
-
-	def _resubmitJob( self, job ):
+	def _resubmitJob( self, job, previousStatus ):
 		"""Adds an existing job to the queue and returns its ID (assigned by the queue)"""
-		self._removeJobFile(job)
-		self.write(asJSON(job.export()), self._getPath(job, QUEUE_INCOMING))
+		self._removeJobFile(job, previousStatus)
+		self.write(asJSON(job.export()), self._getPath(job))
 		return job.id
 
-	def _completeJob( self, job ):
-		self._removeJobFile(job)
-		self.write(asJSON(job.export()), self._getPath(job, QUEUE_COMPLETED))
+	def _completeJob( self, job, previousStatus ):
+		self._removeJobFile(job, previousStatus)
+		self.write(asJSON(job.export()), self._getPath(job))
 		return job.id
 
-	def _failedJob( self, job ):
-		self._removeJobFile(job)
-		self.write(asJSON(job.export()), self._getPath(job, QUEUE_FAILED))
+	def _failedJob( self, job, previousStatus ):
+		self._removeJobFile(job, previousStatus)
+		self.write(asJSON(job.export()), self._getPath(job))
 		return job.id
 
-	def _removeJob( self, job ):
-		self._removeJobFile(job)
+	def _removeJob( self, job, previousStatus=None ):
+		# NOTE: This method is kept as it's used by the queue
+		self._removeJobFile(job, previousStatus)
 
-	def _removeJobFile( self, job ):
+	def _removeJobFile( self, job, status=None ):
 		"""Physically removes the job file."""
-		path = self._getPath(job)
+		path = self._getPath(job, status)
 		if os.path.exists(path): os.unlink(path)
+
+	def _getPath( self, job, status=None ):
+		job_id = None
+		if status:
+			if isinstance(job, Job):
+				job_id = job.id
+				assert job_id, "Job has no id, so it cannot be saved: {0}".format(job)
+			else:
+				job_id = job
+				assert job_id, "No job or job id given"
+			queue  = self.QUEUES[status]
+		else:
+			assert isinstance(job, Job), "Queue can only be omitted when the given job is an instance (not a job id)"
+			queue  = self.QUEUES[job.status]
+			job_id = job.id
+			assert job_id, "Job has no id, so it cannot be saved: {0}".format(job)
+		path = self.path + "/" + queue + "/" + job_id + self.SUFFIX
+		print ">>>", path
+		return path
+
+	def _getJob( self, jobOrJobID ):
+		"""Returns the job given its job id."""
+		path   = None
+		job_id = None
+		if isinstance(jobOrJobID, Job):
+			path   = self._getPath(jobOrJobID)
+			job_id = jobOrJobID.id
+		else:
+			job_id = jobOrJobID
+			for status in self.QUEUES:
+				_ = self._getPath(job_id, status)
+				if os.path.exists(_):
+					path = _
+					break
+		if path and os.path.exists(path):
+			job = json.loads(self.read(path))
+			job = Job.Import(job, job_id)
+			return job
+		return None
 
 # -----------------------------------------------------------------------------
 #
@@ -1040,6 +1061,7 @@ class Daemon:
 		self.isRunning = True
 		while self.isRunning:
 			if self.queue.run(1) == 0 and self.isRunning:
+				log("No job left, sleeping for {0}s".format(self.sleepPeriod))
 				time.sleep(self.sleepPeriod)
 	
 	def stop( self ):

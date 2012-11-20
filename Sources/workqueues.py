@@ -711,9 +711,7 @@ class Queue:
 		return iteration
 
 	def _onJobSucceeded( self, jobOrJobID, result ):
-		print "ON JOB SUCEEDDE", jobOrJobID
 		job = self._job(jobOrJobID)
-		print "COMPLETING JOB", job
 		self.complete(job)
 
 	def _onJobFailed( self, job, failure ):
@@ -949,7 +947,6 @@ class DirectoryQueue(Queue):
 		return job.id
 
 	def _processJob( self, job, previousStatus ):
-		print "PROCESSING JOB", job, self._getPath(job)
 		self._removeJobFile(job, previousStatus)
 		self.write(asJSON(job.export()), self._getPath(job))
 		return job.id

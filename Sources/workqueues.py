@@ -9,7 +9,7 @@
 # Last mod  : 19-Nov-2012
 # -----------------------------------------------------------------------------
 
-import os, threading, subprocess, time, datetime, sys, json, traceback
+import os, threading, subprocess, time, datetime, sys, json, traceback, signal
 import cStringIO as StringIO
 try:
 	from   retro.core import asJSON
@@ -581,9 +581,10 @@ class Queue:
 	CLEANUP_PERIOD = 60 * 5
 
 	def __init__( self ):
-		self.pool      = Pool()
-		self.jobs      = []
-		self.incidents = []
+		self.pool          = Pool()
+		self.jobs          = []
+		self.incidents     = []
+		self._runningJobs  = []
 		self._lastSelected = -1
 		self.lastClean     = -1
 
@@ -624,6 +625,7 @@ class Queue:
 		# ...if not, we return the time we have to wait up until the next event
 		# Makes sure the pool can process the event
 		# ...if not, we return the maximum time in which the pool will be free/or a callback to when the pool will be free
+		self._runningJobs.append(job)
 		if not job.isUnresolved:
 			if not self.pool:
 				raise Exception("Workqueue has no associated worker pool (see `setPool`)")
@@ -647,6 +649,7 @@ class Queue:
 			self._onJobFailed(job, result)
 		else:
 			self._onJobFailed(job, UnexpectedResult(result))
+		self._runningJobs.remove(job)
 		return result
 
 	def resubmit( self, job ):
@@ -992,7 +995,6 @@ class DirectoryQueue(Queue):
 			job_id = job.id
 			assert job_id, "Job has no id, so it cannot be saved: {0}".format(job)
 		path = self.path + "/" + queue + "/" + job_id + self.SUFFIX
-		print ">>>", path
 		return path
 
 	def _getJob( self, jobOrJobID ):
@@ -1056,8 +1058,19 @@ class Daemon:
 		self.queue       = queue
 		self.isRunning   = False
 		self.sleepPeriod = period
+		self.signalsRegistered = False
 	
+	def _registerSignals( self ):
+		if not self.signalsRegistered:
+			signals = ['SIGINT',  'SIGHUP', 'SIGABRT', 'SIGQUIT', 'SIGTERM']
+			for sig in signals:
+				try:
+					signal.signal(getattr(signal,sig), self.onSignal)
+				except Exception, e:
+					sys.stderr.write("[!] retro.wsgi.createReactor:%s %s\n" % (sig, e))
+
 	def run( self ):
+		self._registerSignals()
 		self.isRunning = True
 		while self.isRunning:
 			if self.queue.run(1) == 0 and self.isRunning:
@@ -1066,5 +1079,9 @@ class Daemon:
 	
 	def stop( self ):
 		self.isRunning = False
+
+	def onSignal( self ):
+		for job in queue.getRunningJobs():
+			queue.resubmit(job)
 
 # EOF - vim: tw=80 ts=4 sw=4 noet

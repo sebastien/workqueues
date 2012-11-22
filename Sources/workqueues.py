@@ -6,7 +6,7 @@
 # License   : Revised BSD License
 # -----------------------------------------------------------------------------
 # Creation  : 21-Jun-2012
-# Last mod  : 19-Nov-2012
+# Last mod  : 22-Nov-2012
 # -----------------------------------------------------------------------------
 
 import os, threading, subprocess, time, datetime, sys, json, traceback, signal
@@ -24,14 +24,15 @@ except ImportError:
 # FIXME: Make sure that exceptions are well caught everywhere. For instance
 # DirectoryQueue will just fail if it cannot decode the JSON
 
-__version_ = "0.7.0"
+__version_ = "0.7.1"
 __doc__    = """\
 """
 
 # Hooks for custom logging functions
-log  = lambda *_:sys.stdout.write(" -  %s\n" % (" ".join(map(str,_))))
-warn = lambda *_:sys.stdout.write("WRN %s\n" % (" ".join(map(str,_))))
-err  = lambda *_:sys.stderr.write("ERR %s\n" % (" ".join(map(str,_))))
+debug = lambda *_:sys.stdout.write("    %s\n" % (" ".join(map(str,_))))
+log   = lambda *_:sys.stdout.write(" -  %s\n" % (" ".join(map(str,_))))
+warn  = lambda *_:sys.stdout.write("WRN %s\n" % (" ".join(map(str,_))))
+err   = lambda *_:sys.stderr.write("ERR %s\n" % (" ".join(map(str,_))))
 
 # Execution modes for jobs/workers
 AS_FUNCTION      = "function"
@@ -319,6 +320,7 @@ class Job:
 		result_export = None
 		if self.result:
 			result_export = self.result.export()
+		# FIXME: This shoudl be from all attributes
 		base = dict(
 			type      = self.type,
 			timeout   = self.timeout,
@@ -326,6 +328,7 @@ class Job:
 			until     = self.until,
 			frequency = self.frequency,
 			repeat    = self.repeat,
+			retries   = self.retries,
 			data      = data,
 			status    = self.status,
 			result    = result_export
@@ -370,7 +373,11 @@ class Worker:
 		run_type   = runType or self.job.getRunType()
 		assert run_type in (AS_FUNCTION, AS_THREAD, AS_PROCESS), "Unkown run type for worker: %s" % (repr(run_type))
 		if   run_type == AS_FUNCTION:
-			result = self._runAsFunction(self.job)
+			try:
+				result = self._runAsFunction(self.job)
+			except Exception, e:
+				err("Job {0} failed with exception: {1}".format(job, e))
+				result = Failure("Job failed with exception %s" % (e))
 		elif run_type == AS_THREAD:
 			result = Failure("Job run type %s not implemented" % (self.runType))
 		elif run_type == AS_PROCESS:
@@ -506,7 +513,7 @@ class Incident:
 	@staticmethod
 	def GetFailureTag( failure ):
 		if failure:
-			return failure.__class__.__name__  + ":" + str(failure.description)
+			return failure.__class__.__name__  + ":" + job.__class__.__name__
 		else:
 			return None
 
@@ -662,7 +669,7 @@ class Queue:
 	def failure( self, job ):
 		"""Removes the job from the queue after too many failures"""
 		assert job.id != None
-		self._failedJob(job, self.setStatus(JOB_FAILED))
+		self._failedJob(job, job.setStatus(JOB_FAILED))
 		return job
 
 	def complete( self, jobOrJobID ):
@@ -736,6 +743,7 @@ class Queue:
 
 	def _getIncident( self, job, failure ):
 		"""Returns and incident that matches the job and failure"""
+		assert isinstance(failure, Failure),"A Failure instance is expected, got {0}".format(failure)
 		for incident in self.incidents:
 			if incident.log(job, failure):
 				return incident
@@ -872,10 +880,40 @@ class DirectoryQueue(Queue):
 		# We create the directory if it does not exist
 		if not os.path.exists(path):
 			os.makedirs(path)
+		self.clean()
+		# FIXME: Make suret that running jobs that haven't been touched
+		# for X hours are put into resubmitted
+		# for running in self._listJobs(status=JOB_IN_PROCESS):
 		for queue in self.QUEUES.values():
 			queue_path = path + "/" + queue
 			if not os.path.exists(queue_path):
 				os.makedirs(queue_path)
+
+	def clean( self ):
+		Queue.clean(self)
+		# We look for jobs that are registered in more than one queue
+		job_status = {}
+		for status in self.QUEUES:
+			for job in self._listJobs(status):
+				job_status.setdefault(job, [])
+				job_status[job].append(status)
+		for job, status in job_status.items():
+			if len(status) > 2:
+				# For the jobs registered in more than one queue, we want to
+				# keep only one file of the job. The rationale is that if it's
+				# still in submitted, then it might have failed, so we'll keep
+				# the submitted. The risk is doing it twice, but it's better
+				# than not doing it.
+				keep = None
+				if   JOB_SUBMITTED   in status: keep = JOB_SUBMITTED
+				elif JOB_RESUBMITTED in status: keep = JOB_RESUBMITTED
+				elif JOB_COMPLETED   in status: keep = JOB_COMPLETED
+				elif JOB_FAILED      in status: keep = JOB_FAILED
+				elif JOB_REMOVED     in status: keep = JOB_REMOVED
+				status.remove(keep)
+				for _ in status:
+					warn("Removing duplicate job file", _getPath(job, _))
+					self._removeJobFile(job, _)
 
 	def read( self, path, sync=True ):
 		"""Atomically read the file at the given path"""
@@ -943,37 +981,43 @@ class DirectoryQueue(Queue):
 		"""Adds a new job to the queue and returns its ID (assigned by the queue)"""
 		new_id = self.timestamp() + "-" + job.__class__.__name__
 		job.setID(new_id)
-		self.write(asJSON(job.export()), self._getPath(job))
+		self._writeJob(job)
 		return job.id
 
 	def _processJob( self, job, previousStatus ):
 		self._removeJobFile(job, previousStatus)
-		self.write(asJSON(job.export()), self._getPath(job))
+		self._writeJob(job)
 		return job.id
 
 	def _resubmitJob( self, job, previousStatus ):
 		"""Adds an existing job to the queue and returns its ID (assigned by the queue)"""
 		self._removeJobFile(job, previousStatus)
-		self.write(asJSON(job.export()), self._getPath(job))
+		self._writeJob(job)
 		return job.id
 
 	def _completeJob( self, job, previousStatus ):
 		self._removeJobFile(job, previousStatus)
-		self.write(asJSON(job.export()), self._getPath(job))
+		self._writeJob(job)
 		return job.id
 
 	def _failedJob( self, job, previousStatus ):
 		self._removeJobFile(job, previousStatus)
-		self.write(asJSON(job.export()), self._getPath(job))
+		self._writeJob(job)
 		return job.id
 
 	def _removeJob( self, job, previousStatus=None ):
 		# NOTE: This method is kept as it's used by the queue
 		self._removeJobFile(job, previousStatus)
 
+	def _writeJob( self, job ):
+		path = self._getPath(job)
+		debug("DirectoryQueue save {0}".format(path[len(self.path):]))
+		self.write(asJSON(job.export()), path)
+
 	def _removeJobFile( self, job, status=None ):
 		"""Physically removes the job file."""
 		path = self._getPath(job, status)
+		debug("DirectoryQueue remove {0}".format(path[len(self.path):]))
 		if os.path.exists(path): os.unlink(path)
 
 	def _getPath( self, job, status=None ):
@@ -1009,6 +1053,7 @@ class DirectoryQueue(Queue):
 					path = _
 					break
 		if path and os.path.exists(path):
+			debug("DirectoryQueue read {0}".format(path[len(self.path):]))
 			job = json.loads(self.read(path))
 			job = Job.Import(job, job_id)
 			return job
@@ -1077,7 +1122,7 @@ class Daemon:
 	def stop( self ):
 		self.isRunning = False
 
-	def onSignal( self ):
+	def onSignal( self, a, b, c ):
 		for job in queue.getRunningJobs():
 			queue.resubmit(job)
 

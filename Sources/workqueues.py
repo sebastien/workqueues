@@ -505,6 +505,7 @@ class Incident:
 	
 	@staticmethod
 	def GetJobTag( job ):
+		"""Returns the signature of the job type"""
 		if job:
 			return job.__class__.__name__
 		else:
@@ -512,8 +513,10 @@ class Incident:
 
 	@staticmethod
 	def GetFailureTag( failure ):
+		"""Returns the signature of the failure. The signature is what is 
+		used to group failures, by default it's the class name."""
 		if failure:
-			return failure.__class__.__name__  + ":" + job.__class__.__name__
+			return failure.__class__.__name__
 		else:
 			return None
 
@@ -956,9 +959,11 @@ class DirectoryQueue(Queue):
 		)
 
 	def _listJobs( self, status=JOB_SUBMITTED ):
-		for _ in os.listdir(self.path + "/" + self.QUEUES[status]):
-			if _.endswith(self.SUFFIX):
-				yield _[:-len(self.SUFFIX)]
+		path = self.path + "/" + self.QUEUES[status]
+		if os.path.exists(path):
+			for _ in os.listdir(path):
+				if _.endswith(self.SUFFIX):
+					yield _[:-len(self.SUFFIX)]
 
 	def _getNextJob( self, status=JOB_SUBMITTED ):
 		"""Returns the next job and sets it as selected in this queue"""
@@ -1007,7 +1012,8 @@ class DirectoryQueue(Queue):
 
 	def _removeJob( self, job, previousStatus=None ):
 		# NOTE: This method is kept as it's used by the queue
-		self._removeJobFile(job, previousStatus)
+		job = self._getJob(job)
+		self._removeJobFile(job, previousStatus or job.status)
 
 	def _writeJob( self, job ):
 		path = self._getPath(job)

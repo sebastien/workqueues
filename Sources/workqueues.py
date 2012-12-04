@@ -16,6 +16,8 @@ try:
 except ImportError:
 	import json.dumps as     asJSON
 
+# FIXME: Deal with Corrupt job files!
+
 # TODO: Add Runner 1) Inline 2) Thread 3) Process 4) TMUX
 # TODO: Generator support in Job's run() to divide work?
 # TODO : Add support for storing the job's results -- queues should probably
@@ -1060,7 +1062,13 @@ class DirectoryQueue(Queue):
 					break
 		if path and os.path.exists(path):
 			debug("DirectoryQueue read {0}".format(path[len(self.path):]))
-			job = json.loads(self.read(path))
+			try:
+				job = json.loads(self.read(path))
+			except ValueError, e:
+				# FIXME: We should do something with that!
+				# If we're here, we can't decode the JSON properly
+				error("Corrupt job file: " + str(path))
+				return None
 			job = Job.Import(job, job_id)
 			return job
 		return None
@@ -1122,14 +1130,15 @@ class Daemon:
 		self.isRunning = True
 		while self.isRunning:
 			if self.queue.run(1) == 0 and self.isRunning:
-				log("No job left, sleeping for {0}s".format(self.sleepPeriod))
+				t = time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime())
+				log("{0} - No job left, sleeping for {1}s".format(t, self.sleepPeriod))
 				time.sleep(self.sleepPeriod)
 	
 	def stop( self ):
 		self.isRunning = False
 
-	def onSignal( self, a, b, c ):
-		for job in queue.getRunningJobs():
-			queue.resubmit(job)
+	def onSignal( self, a=None, b=None, c=None ):
+		for job in self.queue.getRunningJobs():
+			self.queue.resubmit(job)
 
 # EOF - vim: tw=80 ts=4 sw=4 noet

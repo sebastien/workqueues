@@ -6,7 +6,7 @@
 # License   : Revised BSD License
 # -----------------------------------------------------------------------------
 # Creation  : 21-Jun-2012
-# Last mod  : 22-Nov-2012
+# Last mod  : 20-Dec-2012
 # -----------------------------------------------------------------------------
 
 import os, threading, subprocess, time, datetime, sys, json, traceback, signal
@@ -26,7 +26,7 @@ except ImportError:
 # FIXME: Make sure that exceptions are well caught everywhere. For instance
 # DirectoryQueue will just fail if it cannot decode the JSON
 
-__version_ = "0.7.1"
+__version_ = "0.7.2"
 __doc__    = """\
 """
 
@@ -693,6 +693,10 @@ class Queue:
 		"""Lists the jobs ids in the job queue, by ascending chronological order"""
 		return  self._listJobs()
 
+	def getRunningJobs( self ):
+		"""Returns the list of jobs that are currently running (aka. `IN_PROCESS`)"""
+		return self.list(status=JOB_IN_PROCESS)
+
 	def get( self, jobID ):
 		"""Returns the Job instance with the given ID"""
 		return self._getJob(jobID)
@@ -910,14 +914,15 @@ class DirectoryQueue(Queue):
 				# the submitted. The risk is doing it twice, but it's better
 				# than not doing it.
 				keep = None
-				if   JOB_SUBMITTED   in status: keep = JOB_SUBMITTED
+				if   JOB_COMPLETED   in status: keep = JOB_COMPLETED
+				elif JOB_SUBMITTED   in status: keep = JOB_SUBMITTED
 				elif JOB_RESUBMITTED in status: keep = JOB_RESUBMITTED
-				elif JOB_COMPLETED   in status: keep = JOB_COMPLETED
+				elif JOB_IN_PROCESS  in status: keep = JOB_IN_PROCESS
 				elif JOB_FAILED      in status: keep = JOB_FAILED
 				elif JOB_REMOVED     in status: keep = JOB_REMOVED
 				status.remove(keep)
 				for _ in status:
-					warn("Removing duplicate job file", _getPath(job, _))
+					warn("Removing duplicate job file {0}/{1} {2}".format(_, status, self._getPath(job, _)))
 					self._removeJobFile(job, _)
 
 	def read( self, path, sync=True ):
@@ -1138,7 +1143,8 @@ class Daemon:
 		self.isRunning = False
 
 	def onSignal( self, a=None, b=None, c=None ):
-		for job in self.queue.getRunningJobs():
-			self.queue.resubmit(job)
+		self.stop()
+		map(self.queue.resubmit, self.queue.getRunningJobs())
+		sys.exit(0)
 
 # EOF - vim: tw=80 ts=4 sw=4 noet

@@ -16,6 +16,7 @@ try:
 except ImportError:
 	import json.dumps as     asJSON
 
+# FIXME: Failed jobs seem to stay forever in the queue without being removed
 # FIXME: Deal with Corrupt job files!
 
 # TODO: Add Runner 1) Inline 2) Thread 3) Process 4) TMUX
@@ -43,7 +44,7 @@ AS_PROCESS       = "process"
 
 # States for jobs
 # JOB:
-# 
+#
 # 	STATES = dict(
 # 		"submitted"   : ("resubmitted", "completed", "failed")
 # 		"resubmitted" : ("resubmitted", "completed", "failed")
@@ -202,6 +203,7 @@ class Job:
 			name = job_class.__module__ + "." + job_class.__name__.split(".")[-1]
 			if not JOB_CLASSES.has_key(name):
 				JOB_CLASSES[name] = job_class
+		return jobClasses[0] if len(jobClasses) == 1 else jobClasses
 
 	@classmethod
 	def GetClass( cls, name ):
@@ -209,7 +211,9 @@ class Job:
 		# the class, but by doing this we rely on explicit job registration.
 		# The main reason is that jobs might be insecure, so we want to limit
 		# the possibility to execute arbitrary code.
-		if JOB_CLASSES.has_key(name):
+		if not name:
+			return None
+		elif JOB_CLASSES.has_key(name):
 			return JOB_CLASSES[name]
 		else:
 			try:
@@ -256,6 +260,7 @@ class Job:
 		self.type         = self.__class__.__module__ + "." + self.__class__.__name__.split(".")[-1]
 		self.status       = None
 		self.result       = None
+		self._onProgress  = []
 		assert "id" not in self.DATA, "DATA does not allow an 'id' attribute"
 
 	def setStatus( self, status ):
@@ -263,8 +268,16 @@ class Job:
 		self.status = status
 		return old_status
 
+	def onProgress( self, callback ):
+		self._onProgress.append(callback)
+
 	def updateProgress( self, progress ):
 		self.progress = progress
+		try:
+			for _ in self._onProgress:
+				_(progress,_)
+		except Exception, e:
+			err("Exception in job progress callback: " + str(e))
 
 	def isComplete( self ):
 		return self.result and isinstance(self.result, Success)
@@ -285,7 +298,7 @@ class Job:
 		return self
 
 	def setResult( self, result ):
-		"""Sets the result obtained from running this job, wrapping it in 
+		"""Sets the result obtained from running this job, wrapping it in
 		a Result instance if necessary."""
 		if not isinstance(result, Result): result = Result(result)
 		self.result = result
@@ -337,7 +350,7 @@ class Job:
 		)
 		for field in self.DATA: data[field] = getattr(self, field)
 		return base
-	
+
 	def __str__( self ):
 		data = asJSON(self.export()["data"])
 		if len(data) > 80: data = data[:77] + "..."
@@ -414,7 +427,7 @@ class Worker:
 			error_msg = error_msg.getvalue()
 			result = Failure(error_msg, job=job)
 		self._setResultTime(result, start_time)
-		# We have to put the doJobEnd here, as callbacks might fail or 
+		# We have to put the doJobEnd here, as callbacks might fail or
 		# take too long
 		self.doJobEnd(result)
 		return result
@@ -456,7 +469,7 @@ class Pool:
 			return None
 
 	def _onWorkerJobEnd( self, worker, job ):
-		"""Callback called when a workers's job has ended (wether with a 
+		"""Callback called when a workers's job has ended (wether with a
 		success or failure)"""
 		self._semaphore.release()
 		self._workersCount -= 1
@@ -479,7 +492,7 @@ class Scheduler:
 
 	def __init__( self ):
 		pass
-			
+
 	def select( self, queue ):
 		pass
 
@@ -504,7 +517,7 @@ class Incident:
 	# If we have 5 incidents withing 15 minutes, then we trigger the incident
 	FAILURE_PERIOD       = 60 * 15
 	FAILURE_COUNT        = 5
-	
+
 	@staticmethod
 	def GetJobTag( job ):
 		"""Returns the signature of the job type"""
@@ -515,7 +528,7 @@ class Incident:
 
 	@staticmethod
 	def GetFailureTag( failure ):
-		"""Returns the signature of the failure. The signature is what is 
+		"""Returns the signature of the failure. The signature is what is
 		used to group failures, by default it's the class name."""
 		if failure:
 			return failure.__class__.__name__
@@ -573,7 +586,7 @@ class Incident:
 				callback(self)
 			except Exception, e:
 				err("Exception in incident's callback: %s" % (e))
-	
+
 	def __str__( self ):
 		return "%s:%s" % (self.jobTag, self.failureTag)
 
@@ -605,7 +618,7 @@ class Queue:
 		# NOTE: Shouldn't we do something with the existing pool if jobs
 		# are currently running?
 		self.pool = pool
-	
+
 	def clean( self ):
 		"""Executes periodic cleaning up operations on the queue"""
 		# FIXME: WHat should be done here?
@@ -631,7 +644,7 @@ class Queue:
 		job = self._job(jobOrID)
 		self._processJob(job, job.setStatus(JOB_IN_PROCESS))
 		return self._runJob(job)
-	
+
 	def _runJob( self, job ):
 		# Makes sure it's time to execute it
 		# ...if not, we return the time we have to wait up until the next event
@@ -651,7 +664,7 @@ class Queue:
 				result = Failure(str(e), value=e, job=job)
 		else:
 			err(self.__class__.__name__, "UNRESOLVED ", job)
-			result  = Failure("Unresolved job")
+			result = Failure("Unresolved job")
 		if   isinstance(result, Success):
 			log(self.__class__.__name__, "SUCCESS    ", job, ":", result)
 			job.retries = 0
@@ -670,7 +683,7 @@ class Queue:
 		job.retries += 1
 		self._resubmitJob(job, job.setStatus(JOB_RESUBMITTED))
 		return job
-	
+
 	def failure( self, job ):
 		"""Removes the job from the queue after too many failures"""
 		assert job.id != None
@@ -701,6 +714,10 @@ class Queue:
 		"""Returns the Job instance with the given ID"""
 		return self._getJob(jobID)
 
+	def isEmpty( self ):
+		"""Tells if the queue is empty or not."""
+		return not self._hasJobs()
+
 	def iterate( self, count=-1 ):
 		while (count == -1 or count > 0) and self._hasJobs():
 			# Takes the next available job
@@ -718,6 +735,9 @@ class Queue:
 			# And finally returns the result
 			yield result
 
+	def poll( self, count=1 ):
+		return list(self.iterate(count))
+
 	def run( self, count=-1 ):
 		"""Runs the workqueue for `count` interations, stopping when
 		no more job is available."""
@@ -732,8 +752,9 @@ class Queue:
 
 	def _onJobFailed( self, job, failure ):
 		"""Called when a job has failed."""
-		incident    = self._getIncident(job, failure)
-		failure.job = job
+		incident     = self._getIncident(job, failure)
+		failure.job  = job
+		job.retries += 1
 		if incident.isAboveThreshold():
 			# If the incident is above threshold, we won't retry the job,
 			# as it's likely to fail again
@@ -768,7 +789,7 @@ class Queue:
 			assert res is not None, "Job has no id"
 			return res
 		else:
-			return jobOrJobID 
+			return jobOrJobID
 
 	def _job( self, jobOrJobID ):
 		if isinstance(jobOrJobID, Job):
@@ -932,7 +953,7 @@ class DirectoryQueue(Queue):
 		fd    = os.open(path, flags)
 		data  = None
 		try:
-			last_read = 1 
+			last_read = 1
 			data      = []
 			while last_read > 0:
 				t = os.read(fd, 128000)
@@ -1045,6 +1066,12 @@ class DirectoryQueue(Queue):
 			queue  = self.QUEUES[status]
 		else:
 			assert isinstance(job, Job), "Queue can only be omitted when the given job is an instance (not a job id)"
+			if job.status is None:
+				# If the job has no status, then we retrieve the job through
+				# the _getJob (which will override the job's declared status)
+				existing_job = self._getJob(job.id)
+				if existing_job: job.status = existing_job.status
+			assert (job.status is not None, "Job has no status: {0}".format(job))
 			queue  = self.QUEUES[job.status]
 			job_id = job.id
 			assert job_id, "Job has no id, so it cannot be saved: {0}".format(job)
@@ -1053,8 +1080,9 @@ class DirectoryQueue(Queue):
 
 	def _getJob( self, jobOrJobID ):
 		"""Returns the job given its job id."""
-		path   = None
-		job_id = None
+		path       = None
+		job_id     = None
+		job_status = None
 		if isinstance(jobOrJobID, Job):
 			path   = self._getPath(jobOrJobID)
 			job_id = jobOrJobID.id
@@ -1063,7 +1091,8 @@ class DirectoryQueue(Queue):
 			for status in self.QUEUES:
 				_ = self._getPath(job_id, status)
 				if os.path.exists(_):
-					path = _
+					job_status = status
+					path       = _
 					break
 		if path and os.path.exists(path):
 			debug("DirectoryQueue read {0}".format(path[len(self.path):]))
@@ -1075,6 +1104,10 @@ class DirectoryQueue(Queue):
 				error("Corrupt job file: " + str(path))
 				return None
 			job = Job.Import(job, job_id)
+			# NOTE: We override the job status contained in the JSON
+			# with its actual location
+			if job_status is not None:
+				job.status = job_status
 			return job
 		return None
 
@@ -1120,7 +1153,7 @@ class Daemon:
 		self.isRunning   = False
 		self.sleepPeriod = period
 		self.signalsRegistered = False
-	
+
 	def _registerSignals( self ):
 		if not self.signalsRegistered:
 			signals = ['SIGINT',  'SIGHUP', 'SIGABRT', 'SIGQUIT', 'SIGTERM']
@@ -1138,7 +1171,7 @@ class Daemon:
 				t = time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime())
 				log("{0} - No job left, sleeping for {1}s".format(t, self.sleepPeriod))
 				time.sleep(self.sleepPeriod)
-	
+
 	def stop( self ):
 		self.isRunning = False
 

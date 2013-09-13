@@ -6,7 +6,6 @@ class JobThatFails(Job):
 	def run( self ):
 		raise Exception("Failure")
 
-
 class JobFailure(unittest.TestCase):
 
 	def setUp( self ):

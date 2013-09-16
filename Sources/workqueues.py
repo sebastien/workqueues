@@ -331,11 +331,12 @@ class Job:
 		# If the job is unresolved, then we export the same data that was
 		# imported
 		if self.isUnresolved: return self.isUnresolved
-		data = {}
 		result_export = None
 		if self.result:
 			result_export = self.result.export()
-		# FIXME: This shoudl be from all attributes
+		# FIXME: This should be from all attributes
+		data = {}
+		for field in self.DATA: data[field] = getattr(self, field)
 		base = dict(
 			type      = self.type,
 			timeout   = self.timeout,
@@ -348,7 +349,6 @@ class Job:
 			status    = self.status,
 			result    = result_export
 		)
-		for field in self.DATA: data[field] = getattr(self, field)
 		return base
 
 	def __str__( self ):
@@ -626,7 +626,8 @@ class Queue:
 
 	def clear( self ):
 		"""Clears all the jobs and incidents from the queue"""
-		map(self._removeJob, self.list())
+		for job in self.list():
+			self.remove(job)
 		self.incidents = []
 
 	def submit( self, job ):
@@ -634,9 +635,11 @@ class Queue:
 		if type(job) in (tuple, list):
 			return map(self.submit, job)
 		else:
-			job.submitted = timestamp ()
-			self._submitJob(job, job.setStatus(JOB_SUBMITTED))
-			return job
+			if self.has(job):
+				return job
+			else:
+				job.submitted = timestamp ()
+				return self._submitJob(job, job.setStatus(JOB_SUBMITTED if job.retries == 0 else JOB_RESUBMITTED))
 
 	def process( self, jobOrID):
 		"""Processes the given job. This will mark it as in process and
@@ -682,6 +685,9 @@ class Queue:
 		# We increase the number of retries in the job
 		job.retries += 1
 		self._resubmitJob(job, job.setStatus(JOB_RESUBMITTED))
+		assert job.status == JOB_RESUBMITTED
+		assert self.get(job.id).retries == job.retries, "{0}.retries {1} != {2}".format(job.id, self.get(job.id).retries, job.retries)
+		assert self.get(job.id).status  == job.status, "{0}.status {1} != {2}".format(job.id, self.get(job.id).status, job.status)
 		return job
 
 	def failure( self, job ):
@@ -699,7 +705,7 @@ class Queue:
 
 	def remove( self, job ):
 		"""Removes the job from the queue"""
-		self._removeJob(job, self.setStatus(JOB_REMOVED))
+		self._removeJob(job, job.setStatus(JOB_REMOVED))
 		return job
 
 	def list( self, until=None, since=None, status=None, queue=None ):
@@ -714,9 +720,17 @@ class Queue:
 		"""Returns the Job instance with the given ID"""
 		return self._getJob(jobID)
 
+	def has( self, jobID ):
+		"""Tells if this queue has the given job."""
+		return self.get(jobID) != None
+
 	def isEmpty( self ):
 		"""Tells if the queue is empty or not."""
 		return not self._hasJobs()
+
+	def count( self, status=None ):
+		"""Tells how many jobs are pending/incoming"""
+		raise NotImplementedError
 
 	def iterate( self, count=-1 ):
 		while (count == -1 or count > 0) and self._hasJobs():
@@ -754,7 +768,6 @@ class Queue:
 		"""Called when a job has failed."""
 		incident     = self._getIncident(job, failure)
 		failure.job  = job
-		job.retries += 1
 		if incident.isAboveThreshold():
 			# If the incident is above threshold, we won't retry the job,
 			# as it's likely to fail again
@@ -786,7 +799,6 @@ class Queue:
 	def _id( self, jobOrJobID ):
 		if isinstance(jobOrJobID, Job):
 			res = jobOrJobID.id
-			assert res is not None, "Job has no id"
 			return res
 		else:
 			return jobOrJobID
@@ -801,38 +813,42 @@ class Queue:
 
 	def _getNextJob( self ):
 		"""Returns the next job and sets it as selected in this queue"""
-		raise Exception("Not implemented yet")
+		raise NotImplementedError
 
 	def _getJob( self, jobID ):
+		raise NotImplementedError
 		"""Returns the job given its job id."""
-		raise Exception("Not implemented yet")
 
 	def _hasJobs( self ):
 		"""Tells if there are still jobs submitted in the queue"""
-		raise Exception("Not implemented yet")
+		raise NotImplementedError
+
+	def _listJobs( self, status=None ):
+		"""Lists the jobs available with the given status (or all otherwise)"""
+		raise NotImplementedError
 
 	def _submitJob( self, job, previousStatus ):
 		"""Adds a new job to the queue and returns its ID (assigned by the queue)"""
-		raise Exception("Not implemented yet")
+		raise NotImplementedError
 
 	def _processJob( self, job, previousStatus ):
 		"""A job is being processed."""
-		raise Exception("Not implemented yet")
+		raise NotImplementedError
 
 	def _resubmitJob( self, job, previousStatus ):
 		"""Adds an existing job to the queue and returns its ID (assigned by the queue)"""
-		raise Exception("Not implemented yet")
+		raise NotImplementedError
 
 	def _completeJob( self, job, previousStatus ):
-		raise Exception("Not implemented yet")
+		raise NotImplementedError
 
 	def _failedJob( self, job, previousStatus ):
 		"""A job that has failed is archived and might be re-run later."""
-		raise Exception("Not implemented yet")
+		raise NotImplementedError
 
 	def _removeJob( self, job, previousStatus ):
 		"""Removes a job from the queue, permanently"""
-		raise Exception("Not implemented yet")
+		raise NotImplementedError
 
 
 # -----------------------------------------------------------------------------
@@ -858,7 +874,15 @@ class MemoryQueue(Queue):
 		"""Tells if there are still jobs submitted in the queue"""
 		return self.jobs
 
+	def _listJobs( self, status=None ):
+		return self.jobs
+
+	def _removeJob( self, job, status=None ):
+		self.jobs.remove(self._getJob(job))
+		return self
+
 	def _getJob( self, jobID ):
+		jobID = self._id(jobID)
 		for job in self.jobs:
 			if job.id == jobID:
 				return job
@@ -868,13 +892,14 @@ class MemoryQueue(Queue):
 		"""Adds a new job to the queue and returns its ID (assigned by the queue)"""
 		# FIXME: Should be synchronized
 		self.jobs.append(job)
-		return job.setID("%s@%s" % (len(self.jobs) - 1, time.time())).id
+		job.setID("%s@%s" % (len(self.jobs) - 1, time.time()))
+		return job
 
 	def _resubmitJob( self, job, previousStatus ):
 		"""Adds an existing job to the queue and returns its ID (assigned by the queue)"""
 		# FIXME: Should be synchronized
 		self.jobs.append(job)
-		return job.id
+		return job
 
 	def _completeJob( self, job, previousStatus ):
 		# NOTE: This is pretty simple, but should be optimized for big queues
@@ -1012,31 +1037,32 @@ class DirectoryQueue(Queue):
 
 	def _submitJob( self, job, previousStatus ):
 		"""Adds a new job to the queue and returns its ID (assigned by the queue)"""
+		assert job.id is None
 		new_id = self.timestamp() + "-" + job.__class__.__name__
 		job.setID(new_id)
 		self._writeJob(job)
-		return job.id
+		return job
 
 	def _processJob( self, job, previousStatus ):
 		self._removeJobFile(job, previousStatus)
 		self._writeJob(job)
-		return job.id
+		return job
 
 	def _resubmitJob( self, job, previousStatus ):
 		"""Adds an existing job to the queue and returns its ID (assigned by the queue)"""
 		self._removeJobFile(job, previousStatus)
 		self._writeJob(job)
-		return job.id
+		return job
 
 	def _completeJob( self, job, previousStatus ):
 		self._removeJobFile(job, previousStatus)
 		self._writeJob(job)
-		return job.id
+		return job
 
 	def _failedJob( self, job, previousStatus ):
 		self._removeJobFile(job, previousStatus)
 		self._writeJob(job)
-		return job.id
+		return job
 
 	def _removeJob( self, job, previousStatus=None ):
 		# NOTE: This method is kept as it's used by the queue
@@ -1045,7 +1071,7 @@ class DirectoryQueue(Queue):
 
 	def _writeJob( self, job ):
 		path = self._getPath(job)
-		debug("DirectoryQueue save {0}".format(path[len(self.path):]))
+		debug("DirectoryQueue save   {0}".format(path[len(self.path):]))
 		self.write(asJSON(job.export()), path)
 
 	def _removeJobFile( self, job, status=None ):
@@ -1071,7 +1097,7 @@ class DirectoryQueue(Queue):
 				# the _getJob (which will override the job's declared status)
 				existing_job = self._getJob(job.id)
 				if existing_job: job.status = existing_job.status
-			assert (job.status is not None, "Job has no status: {0}".format(job))
+			assert job.status is not None, "Job has no status: {0}".format(job)
 			queue  = self.QUEUES[job.status]
 			job_id = job.id
 			assert job_id, "Job has no id, so it cannot be saved: {0}".format(job)
@@ -1095,7 +1121,7 @@ class DirectoryQueue(Queue):
 					path       = _
 					break
 		if path and os.path.exists(path):
-			debug("DirectoryQueue read {0}".format(path[len(self.path):]))
+			debug("DirectoryQueue read   {0}".format(path[len(self.path):]))
 			try:
 				job = json.loads(self.read(path))
 			except ValueError, e:
@@ -1108,6 +1134,10 @@ class DirectoryQueue(Queue):
 			# with its actual location
 			if job_status is not None:
 				job.status = job_status
+			# JOB_SUBMITTED and JOB_RESUBMITTED are in the same physical
+			# directory, so we disambiguate using retries
+			if job.status == JOB_SUBMITTED and job.retries > 0:
+				job.status = JOB_RESUBMITTED
 			return job
 		return None
 

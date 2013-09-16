@@ -1,4 +1,4 @@
-import unittest
+import unittest, shutil
 from   workqueues  import *
 
 class SampleJob(Job):
@@ -66,6 +66,15 @@ class BackendTest(unittest.TestCase):
 		job_copy = self.queue.get(job_ref.id)
 		self.assertEquals( job.export(), job_copy.export() )
 
+class DirectoryBackendTest(BackendTest):
+
+	def setUp( self ):
+		Job.Register(SampleJob)
+		self.queue = DirectoryQueue(__file__.split(".")[0])
+
+	def tearDown( self ):
+		self.queue.clear()
+		shutil.rmtree(self.queue.path)
 
 if __name__ == "__main__":
 	unittest.main()

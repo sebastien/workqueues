@@ -58,9 +58,8 @@ class BrokenJobs(unittest.TestCase):
 		self.queue.clear()
 
 	def tearDown( self ):
-		pass
-		# self.queue.clear()
-		# shutil.rmtree(self.queue.path)
+		self.queue.clear()
+		shutil.rmtree(self.queue.path)
 
 	# def testTransparency( self ):
 	# 	"""Makes sure that there's not data loss between import and export"""

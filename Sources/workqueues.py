@@ -705,6 +705,7 @@ class Queue:
 
 	def remove( self, job ):
 		"""Removes the job from the queue"""
+		job = self._job(job)
 		self._removeJob(job, job.setStatus(JOB_REMOVED))
 		return job
 
@@ -1082,6 +1083,9 @@ class DirectoryQueue(Queue):
 
 	def _getPath( self, job, status=None ):
 		job_id = None
+		queue  = None
+		if not job:
+			return None
 		if status:
 			if isinstance(job, Job):
 				job_id = job.id
@@ -1097,12 +1101,16 @@ class DirectoryQueue(Queue):
 				# the _getJob (which will override the job's declared status)
 				existing_job = self._getJob(job.id)
 				if existing_job: job.status = existing_job.status
-			assert job.status is not None, "Job has no status: {0}".format(job)
-			queue  = self.QUEUES[job.status]
+			# If there's a job status, we can assign a queue
+			if job.status:
+				assert job.status is not None, "Job has no status: {0}".format(job)
+				queue  = self.QUEUES[job.status]
 			job_id = job.id
-			assert job_id, "Job has no id, so it cannot be saved: {0}".format(job)
-		path = self.path + "/" + queue + "/" + job_id + self.SUFFIX
-		return path
+		if queue and job_id is not None:
+			return self.path + "/" + queue + "/" + job_id + self.SUFFIX
+		else:
+			# A job without status or id cannot be saved
+			return None
 
 	def _getJob( self, jobOrJobID ):
 		"""Returns the job given its job id."""
@@ -1116,7 +1124,7 @@ class DirectoryQueue(Queue):
 			job_id = jobOrJobID
 			for status in self.QUEUES:
 				_ = self._getPath(job_id, status)
-				if os.path.exists(_):
+				if _ and os.path.exists(_):
 					job_status = status
 					path       = _
 					break

@@ -191,6 +191,19 @@ class Job:
 	RUN           = AS_FUNCTION
 	RETRIES       = 5
 	RETRIES_DELAY = (60 * 1, 60 * 5, 60 * 10, 60 * 15)
+	PROPERTIES    = (
+		"timeout",
+		"scheduled",
+		"submitted",
+		"until",
+		"frequency",
+		"repeat",
+		"id",
+		"retries",
+		"lastRun",
+		"type",
+		"status"
+	)
 
 	@classmethod
 	def Registered( cls, jobClass ):
@@ -232,9 +245,9 @@ class Job:
 			job       = Job()
 			job.isUnresolved = export
 		# NOTE: The following list is the list of all the Job's properties
-		for _ in ["timeout", "scheduled", "submitted", "until", "frequency", "repeat", "id", "retries", "lastRun", "type", "status"]:
-			if export.has_key(_):
-				setattr(job, _, export[_])
+		for k in cls.PROPERTIES:
+			if export.has_key(k):
+				setattr(job, k, export[k])
 		if jobID: job.id  = jobID
 		if export.get("result"):
 			result_json = export["result"]
@@ -337,18 +350,8 @@ class Job:
 		# FIXME: This should be from all attributes
 		data = {}
 		for field in self.DATA: data[field] = getattr(self, field)
-		base = dict(
-			type      = self.type,
-			timeout   = self.timeout,
-			scheduled = self.scheduled,
-			until     = self.until,
-			frequency = self.frequency,
-			repeat    = self.repeat,
-			retries   = self.retries,
-			data      = data,
-			status    = self.status,
-			result    = result_export
-		)
+		base = dict([(k,getattr(self,k)) for k in self.PROPERTIES])
+		base["data"] = data
 		return base
 
 	def __str__( self ):
@@ -683,7 +686,6 @@ class Queue:
 	def resubmit( self, job ):
 		assert job.id != None, "You cannot resumbit a job without an id: %s" % (job)
 		# We increase the number of retries in the job
-		job.retries += 1
 		self._resubmitJob(job, job.setStatus(JOB_RESUBMITTED))
 		assert job.status == JOB_RESUBMITTED
 		assert self.get(job.id).retries == job.retries, "{0}.retries {1} != {2}".format(job.id, self.get(job.id).retries, job.retries)
@@ -769,6 +771,8 @@ class Queue:
 		"""Called when a job has failed."""
 		incident     = self._getIncident(job, failure)
 		failure.job  = job
+		# We increment the number of retries
+		job.retries += 1
 		if incident.isAboveThreshold():
 			# If the incident is above threshold, we won't retry the job,
 			# as it's likely to fail again

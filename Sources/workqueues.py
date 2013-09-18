@@ -6,7 +6,7 @@
 # License   : Revised BSD License
 # -----------------------------------------------------------------------------
 # Creation  : 21-Jun-2012
-# Last mod  : 20-Dec-2012
+# Last mod  : 18-Sep-2013
 # -----------------------------------------------------------------------------
 
 import os, threading, subprocess, time, datetime, sys, json, traceback, signal
@@ -922,9 +922,9 @@ class DirectoryQueue(Queue):
 
 	SUFFIX      = ".json"
 	QUEUES      = {
-		JOB_SUBMITTED    : "incoming",
-		JOB_RESUBMITTED  : "incoming",
-		JOB_IN_PROCESS   : "running",
+		JOB_SUBMITTED    : "submitted",
+		JOB_RESUBMITTED  : "resubmitted",
+		JOB_IN_PROCESS   : "inprocess",
 		JOB_COMPLETED    : "completed",
 		JOB_FAILED       : "failed",
 		JOB_REMOVED      : "removed",
@@ -940,6 +940,7 @@ class DirectoryQueue(Queue):
 		# FIXME: Make suret that running jobs that haven't been touched
 		# for X hours are put into resubmitted
 		# for running in self._listJobs(status=JOB_IN_PROCESS):
+		assert len(self.QUEUES.values()) == len(set(self.QUEUES.values())), "DirectoryQueue must have separate directories for each state"
 		for queue in self.QUEUES.values():
 			queue_path = path + "/" + queue
 			if not os.path.exists(queue_path):
@@ -1068,12 +1069,18 @@ class DirectoryQueue(Queue):
 	def _removeJob( self, job, previousStatus=None ):
 		# NOTE: This method is kept as it's used by the queue
 		job = self._getJob(job)
-		self._removeJobFile(job, previousStatus or job.status)
+		if job:
+			self._removeJobFile(job, previousStatus or job.status)
+		else:
+			debug("DirectoryQueue job already removed {0}".format(job))
 
 	def _writeJob( self, job ):
 		path = self._getPath(job)
-		debug("DirectoryQueue save   {0}".format(path[len(self.path):]))
-		self.write(asJSON(job.export()), path)
+		if path:
+			debug("DirectoryQueue save   {0}".format(path[len(self.path):]))
+			self.write(asJSON(job.export()), path)
+		else:
+			debug("DirectoryQueue cannot find path for job {0}".format(job))
 
 	def _removeJobFile( self, job, status=None ):
 		"""Physically removes the job file."""
@@ -1118,16 +1125,24 @@ class DirectoryQueue(Queue):
 		job_id     = None
 		job_status = None
 		if isinstance(jobOrJobID, Job):
-			path   = self._getPath(jobOrJobID)
 			job_id = jobOrJobID.id
 		else:
 			job_id = jobOrJobID
-			for status in self.QUEUES:
-				_ = self._getPath(job_id, status)
-				if _ and os.path.exists(_):
-					job_status = status
-					path       = _
-					break
+		# We look for the different queues, and see if there's a job with the
+		# given job id (hopefull, there's only one)
+		matching_path = []
+		# FIXME: This is not very fast, but at least it is self-healing. For
+		# high throughput, this might have to be revisited
+		for status in self.QUEUES:
+			_ = self._getPath(job_id, status)
+			if _ and os.path.exists(_):
+				job_status = status
+				if _ not in matching_path:
+					matching_path.append(_)
+		assert (len(matching_path) <= 1), "Job found in multiple places: {0} in {1}".format(job_id, matching_path)
+		if len(matching_path) >= 1:
+			path = matching_path[0]
+		# If the path exists, we load the job and return it
 		if path and os.path.exists(path):
 			debug("DirectoryQueue read   {0}".format(path[len(self.path):]))
 			try:
@@ -1147,7 +1162,9 @@ class DirectoryQueue(Queue):
 			if job.status == JOB_SUBMITTED and job.retries > 0:
 				job.status = JOB_RESUBMITTED
 			return job
-		return None
+		else:
+			# Otherwise the job cannot be found, and then does not exist (anymore)
+			return None
 
 # -----------------------------------------------------------------------------
 #

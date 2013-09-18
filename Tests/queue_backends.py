@@ -45,8 +45,8 @@ class BackendTest(unittest.TestCase):
 		# We retrieve a copy of the job and make sure it's equal. It might
 		# be the same physical instance, but it's not guaranteed.
 		job_copy = self.queue.get(job.id)
-		self.assertEquals( job_copy.export(), job.export() )
 		self.assertEquals( job_copy.status, JOB_SUBMITTED )
+		self.assertEquals( job_copy.export(), job.export() )
 		# Submitting a job twice should not do anything to the job, as
 		# it was already submitted
 		job = self.queue.submit(job)

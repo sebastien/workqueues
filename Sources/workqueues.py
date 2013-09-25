@@ -689,7 +689,7 @@ class Queue:
 		self._resubmitJob(job, job.setStatus(JOB_RESUBMITTED))
 		assert job.status == JOB_RESUBMITTED
 		assert self.get(job.id).retries == job.retries, "{0}.retries {1} != {2}".format(job.id, self.get(job.id).retries, job.retries)
-		assert self.get(job.id).status  == job.status, "{0}.status {1} != {2}".format(job.id, self.get(job.id).status, job.status)
+		assert self.get(job.id).status  == job.status, "{0}.status {1} != {2}".format(job.id,   self.get(job.id).status, job.status)
 		return job
 
 	def failure( self, job ):
@@ -904,6 +904,11 @@ class MemoryQueue(Queue):
 		"""Adds an existing job to the queue and returns its ID (assigned by the queue)"""
 		# FIXME: Should be synchronized
 		self.jobs.append(job)
+		return job
+
+	def _processJob( self, job, previousStatus ):
+		job = self._job(job)
+		assert job in self.jobs, "Job to process was not previously submitted"
 		return job
 
 	def _completeJob( self, job, previousStatus ):

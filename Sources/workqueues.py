@@ -6,7 +6,7 @@
 # License   : Revised BSD License
 # -----------------------------------------------------------------------------
 # Creation  : 21-Jun-2012
-# Last mod  : 18-Sep-2013
+# Last mod  : 26-Sep-2013
 # -----------------------------------------------------------------------------
 
 import os, threading, subprocess, time, datetime, sys, json, traceback, signal
@@ -15,6 +15,10 @@ try:
 	from   retro.core import asJSON
 except ImportError:
 	import json.dumps as     asJSON
+try:
+	import reporter
+except ImportError:
+	import logging as reporter
 
 # FIXME: Failed jobs seem to stay forever in the queue without being removed
 # FIXME: Deal with Corrupt job files!
@@ -27,15 +31,15 @@ except ImportError:
 # FIXME: Make sure that exceptions are well caught everywhere. For instance
 # DirectoryQueue will just fail if it cannot decode the JSON
 
-__version_ = "0.7.2"
+__version_ = "0.7.3"
 __doc__    = """\
 """
 
 # Hooks for custom logging functions
-debug = lambda *_:sys.stdout.write("    %s\n" % (" ".join(map(str,_))))
-log   = lambda *_:sys.stdout.write(" -  %s\n" % (" ".join(map(str,_))))
-warn  = lambda *_:sys.stdout.write("WRN %s\n" % (" ".join(map(str,_))))
-err   = lambda *_:sys.stderr.write("ERR %s\n" % (" ".join(map(str,_))))
+debug = reporter.debug
+info   = reporter.info
+warn   = reporter.warn
+err    = reporter.error
 
 # Execution modes for jobs/workers
 AS_FUNCTION      = "function"
@@ -662,17 +666,17 @@ class Queue:
 				raise Exception("Workqueue has no associated worker pool (see `setPool`)")
 			worker = self.pool.submit(job, block=True)
 			# Now we have the worker and we ask it to run the job
-			log(self.__class__.__name__, "IN PROCESS ", job)
+			info("{0} IN PROCESS {1}".format(self.__class__.__name__,  job))
 			try:
 				result = worker.run()
 			except Exception, e:
-				err(self.__class__.__name, "EXCEPTION while running job", job, ":", e)
+				err("{0} EXCEPTION while running job {1}: {2}".format(self.__class__.__name, job, e))
 				result = Failure(str(e), value=e, job=job)
 		else:
-			err(self.__class__.__name__, "UNRESOLVED ", job)
+			err("{0} UNRESOLVED {1}".format(self.__class__.__name__, job))
 			result = Failure("Unresolved job")
 		if   isinstance(result, Success):
-			log(self.__class__.__name__, "SUCCESS    ", job, ":", result)
+			info("{0} SUCCESS   {1}:{2}".format(self.__class__.__name__, job, result))
 			job.retries = 0
 			# the job is successfully processed
 			self._onJobSucceeded(job, result)
@@ -739,7 +743,7 @@ class Queue:
 		while (count == -1 or count > 0) and self._hasJobs():
 			# Takes the next available job
 			job = self._getNextJob()
-			log(self.__class__.__name__, "SUBMIT     ", job)
+			info("{0} SUBMIT     {1}".format(self.__class__.__name__, job))
 			result = self.process(job)
 			if count > 0: count -= 1
 			# Takes care of cleaning up the queue if it's necessary
@@ -776,16 +780,16 @@ class Queue:
 		if incident.isAboveThreshold():
 			# If the incident is above threshold, we won't retry the job,
 			# as it's likely to fail again
-			warn(self.__class__.__name__, "!INCIDENT", job.id, ":", incident, "with", failure)
+			warn("{0} !INCIDENT {1}:{2} with {3}".format(self.__class__.__name__, job.id, incident, failure))
 			self.failure(job)
 		elif job.canRetry():
 			# If the incident is not above threshold, and the job has not
 			# reached its retry count, we resubmit it
-			warn(self.__class__.__name__, "!RESUBMIT", job.id, "/", job.retries, "because of", failure)
+			warn("{0} !RESUBMIT {1}/{2} because of {3}".format(self.__class__.__name__, job.id, job.retries, failure))
 			self.resubmit(job)
 		else:
 			# Otherwise we remove the job from the queue
-			warn(self.__class__.__name__, "!MAXRETRY", job.id, "/", job.retries, "after", failure)
+			warn("{0} !MAXRETRY {1}/{2} after {3}".format(self.__class__.__name__, job.id, job.retries, failure))
 			self.failure(job)
 		return incident
 
@@ -896,14 +900,16 @@ class MemoryQueue(Queue):
 	def _submitJob( self, job, previousStatus ):
 		"""Adds a new job to the queue and returns its ID (assigned by the queue)"""
 		# FIXME: Should be synchronized
-		self.jobs.append(job)
-		job.setID("%s@%s" % (len(self.jobs) - 1, time.time()))
+		job = self._job(job)
+		if job not in self.jobs:
+			self.jobs.append(job)
+			job.setID("%s@%s" % (len(self.jobs) - 1, time.time()))
 		return job
 
 	def _resubmitJob( self, job, previousStatus ):
 		"""Adds an existing job to the queue and returns its ID (assigned by the queue)"""
-		# FIXME: Should be synchronized
-		self.jobs.append(job)
+		job = self._job(job)
+		assert job in self.jobs, "Resubmitting a job that was not previously submitted"
 		return job
 
 	def _processJob( self, job, previousStatus ):
@@ -1072,6 +1078,7 @@ class DirectoryQueue(Queue):
 
 	def _failedJob( self, job, previousStatus ):
 		self._removeJobFile(job, previousStatus)
+		assert job.status == JOB_FAILED
 		self._writeJob(job)
 		return job
 
@@ -1225,7 +1232,7 @@ class Daemon:
 				try:
 					signal.signal(getattr(signal,sig), self.onSignal)
 				except Exception, e:
-					sys.stderr.write("[!] retro.wsgi.createReactor:%s %s\n" % (sig, e))
+					error("Cannot register signals: {0}".format(e))
 
 	def run( self ):
 		self._registerSignals()
@@ -1233,7 +1240,7 @@ class Daemon:
 		while self.isRunning:
 			if self.queue.run(1) == 0 and self.isRunning:
 				t = time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime())
-				log("{0} - No job left, sleeping for {1}s".format(t, self.sleepPeriod))
+				info("{0} - No job left, sleeping for {1}s".format(t, self.sleepPeriod))
 				time.sleep(self.sleepPeriod)
 
 	def stop( self ):

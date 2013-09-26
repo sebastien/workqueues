@@ -22,7 +22,7 @@ class FailingJob(Job):
 	def run( self ):
 		assert False, "This job will always fail"
 
-class BackendTest(unittest.TestCase):
+class MemoryBackendTest(unittest.TestCase):
 
 	def setUp( self ):
 		Job.Register(SampleJob)
@@ -38,6 +38,39 @@ class BackendTest(unittest.TestCase):
 		self.queue.submit(SampleJob())
 		self.assertFalse(self.queue.isEmpty())
 		self.queue.clear()
+		self.assertTrue(self.queue.isEmpty())
+
+	def testList( self ):
+		# We test with a job that runs properly
+		job = SampleJob()
+		self.assertTrue(self.queue.isEmpty())
+		self.queue.submit(job)
+		self.assertFalse(self.queue.isEmpty())
+		content = list(self.queue.list())
+		self.assertEquals(len(content), 1)
+		self.assertEquals([self.queue.get(job).export()], [self.queue.get(_).export() for _ in content])
+		self.assertEquals(self.queue.run(1), 1)
+		self.assertTrue(self.queue.isEmpty())
+		self.assertEquals([], list(self.queue.list()))
+		# We test with submitting the job
+		job = FailingJob()
+		self.assertTrue(self.queue.isEmpty())
+		for i in range(0, job.RETRIES - 1):
+			self.queue.submit(job)
+			self.assertFalse(self.queue.isEmpty())
+			content = list(self.queue.list())
+			self.assertEquals(len(content), 1)
+			self.assertEquals([self.queue.get(job).export()], [self.queue.get(_).export() for _ in content])
+			self.assertEquals(self.queue.run(1), 1)
+			self.assertTrue(self.queue.has(job.id))
+			self.assertTrue(self.queue.get(job.id).retries, i + 1)
+			self.assertFalse(self.queue.isEmpty())
+		self.queue.submit(job)
+		self.assertFalse(self.queue.isEmpty())
+		self.assertEquals(len(list(self.queue.list())), 1)
+		self.assertEquals([self.queue.get(job).export()], [self.queue.get(_).export() for _ in content])
+		self.assertEquals(self.queue.run(1), 1)
+		self.assertFalse(self.queue.has(job.id))
 		self.assertTrue(self.queue.isEmpty())
 
 	def testSubmit( self ):
@@ -126,13 +159,15 @@ class BackendTest(unittest.TestCase):
 		self.assertEquals(self.queue.get(job.id).retries, 0)
 		job_id = job.id
 		# We run the queue, and the job should be automatically resubmitted
-		for retries in range(5):
+		for retries in range(Job.RETRIES - 1):
 			self.assertEquals(self.queue.get(job_id).retries, retries)
 			self.assertEquals(self.queue.get(job_id).status,  JOB_SUBMITTED if retries==0 else JOB_RESUBMITTED)
-			self.queue.run(1)
-		self.queue.run(1)
-		self.assertEquals(self.queue.get(job_id).status, JOB_FAILED)
-		self.assertEquals(self.queue.run(1), 0)
+			self.assertEquals(self.queue.run(1), 1)
+			self.assertFalse(self.queue.isEmpty())
+		# A failed job is removed from the queue
+		self.assertEquals(self.queue.run(1), 1)
+		self.assertTrue  (self.queue.isEmpty())
+		self.assertFalse (self.queue.get(job_id))
 
 	# def testIndirectJobFailure( self ):
 	# 	"""We test the job failure when we're using a new directory queue each
@@ -205,7 +240,7 @@ class BackendTest(unittest.TestCase):
 		self.assertEquals(result.job.id,       job.id)
 		self.assertEquals(result.job.export(), job.export())
 
-class DirectoryBackendTest(BackendTest):
+class DirectoryBackendTest(MemoryBackendTest):
 
 	def setUp( self ):
 		Job.Register(SampleJob)

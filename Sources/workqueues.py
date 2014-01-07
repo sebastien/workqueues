@@ -336,7 +336,10 @@ class Job:
 
 	def shell( self, command, cwd="." ):
 		if type(command) in (tuple, list): command = " ".join(command)
+		# FIXME: Subprocess is sadly a piece of crap, cmd.wait() can still
+		# be blocking in cases where os.popen() would not block at all.
 		cmd      = subprocess.Popen(command, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, cwd=cwd, env=dict(LANG="C"))
+		# NOTE: is the status really necessary?
 		status   = cmd.wait()
 		res, err = cmd.communicate()
 		if status == 0:

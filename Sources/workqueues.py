@@ -261,6 +261,20 @@ class Job:
 			setattr(job, _, v)
 		return job
 
+	@classmethod
+	def Shell( cls, command, cwd="." ):
+		if type(command) in (tuple, list): command = " ".join(command)
+		# FIXME: Subprocess is sadly a piece of crap, cmd.wait() can still
+		# be blocking in cases where os.popen() would not block at all.
+		cmd      = subprocess.Popen(command, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, cwd=cwd, env=dict(LANG="C"))
+		# NOTE: is the status really necessary?
+		status   = cmd.wait()
+		res, err = cmd.communicate()
+		if status == 0:
+			return res
+		else:
+			return err
+
 	def __init__( self, env=None ):
 		self.timeout      = -1
 		self.scheduled    = -1
@@ -335,17 +349,7 @@ class Job:
 		raise Exception("Job.run not implemented")
 
 	def shell( self, command, cwd="." ):
-		if type(command) in (tuple, list): command = " ".join(command)
-		# FIXME: Subprocess is sadly a piece of crap, cmd.wait() can still
-		# be blocking in cases where os.popen() would not block at all.
-		cmd      = subprocess.Popen(command, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, cwd=cwd, env=dict(LANG="C"))
-		# NOTE: is the status really necessary?
-		status   = cmd.wait()
-		res, err = cmd.communicate()
-		if status == 0:
-			return res
-		else:
-			return err
+		return self.Shell(command, cwd)
 
 	def export( self ):
 		# If the job is unresolved, then we export the same data that was

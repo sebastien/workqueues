@@ -6,7 +6,7 @@
 # License   : Revised BSD License
 # -----------------------------------------------------------------------------
 # Creation  : 21-Jun-2012
-# Last mod  : 26-Sep-2013
+# Last mod  : 19-Feb-2016
 # -----------------------------------------------------------------------------
 
 import os, threading, subprocess, time, datetime, sys, json, traceback, signal
@@ -36,15 +36,13 @@ __doc__    = """\
 """
 
 # Hooks for custom logging functions
-debug = reporter.debug
-info   = reporter.info
-warn   = reporter.warn
-err    = reporter.error
+logging = reporter.bind("workqueues")
 
 # Execution modes for jobs/workers
 AS_FUNCTION      = "function"
 AS_THREAD        = "thread"
 AS_PROCESS       = "process"
+SHELL_ESCAPE     = " '\";`|><&\n"
 
 # States for jobs
 # JOB:
@@ -58,6 +56,7 @@ AS_PROCESS       = "process"
 
 JOB_SUBMITTED    = "submitted"
 JOB_RESUBMITTED  = "resubmitted"
+# FIXME: Maybe IN_PROCESS shoud be running?
 JOB_IN_PROCESS   = "inprocess"
 JOB_COMPLETED    = "completed"
 JOB_FAILED       = "failed"
@@ -67,6 +66,10 @@ JOB_CLASSES      = {}
 def timestamp():
 	"""Returns the current time as an UTC timestamp in seconds"""
 	return time.time() - time.timezone
+
+def shellsafe( path ):
+	"""Makes sure that the given path/string is escaped and safe for shell"""
+	return "".join([("\\" + _) if _ in SHELL_ESCAPE else _ for _ in path])
 
 # -----------------------------------------------------------------------------
 #
@@ -113,10 +116,11 @@ class Result:
 		result.started  = data["started"]
 		return result
 
-	def __init__( self, value ):
+	def __init__( self, value, job=None ):
 		self.duration = -1
 		self.started  = timestamp()
 		self.value    = value
+		self.job      = job.id if isinstance(job, Job) else job
 
 	def isSuccess( self ):
 		return False
@@ -125,6 +129,9 @@ class Result:
 		return False
 
 	def isTimeout( self ):
+		return False
+
+	def isPending( self ):
 		return False
 
 	def happenedAfter( self, t ):
@@ -140,13 +147,13 @@ class Result:
 			type=self.__class__.__name__.split(".")[-1],
 			value=self.value,
 			started=self.started,
-			duration=self.duration
+			duration=self.duration,
 		)
 
 class Success(Result):
 
-	def __init__( self, value ):
-		Result.__init__(self, value)
+	def __init__( self, value, job=None ):
+		Result.__init__(self, value, job)
 
 	def isSuccess( self ):
 		return True
@@ -154,18 +161,22 @@ class Success(Result):
 class Failure(Result):
 
 	def __init__( self, description=None, value=None, job=None):
-		Result.__init__(self, value)
+		Result.__init__(self, value, job)
 		self.description = description
-		self.job         = job
 
 	def isFailure( self ):
 		return True
 
 	def __str__(self):
 		res = "%s:<%s>" % (self.__class__.__name__, self.description)
-		if self.value: res += " (%s)"     % (self.value)
-		if self.job:   res += " in %s:%s" % (self.job.__class__.__name__, self.job.id)
+		if self.value: res += " (%s)"  % (self.value)
+		if self.job:   res += " in %s" % (self.job)
 		return res
+
+class UnexpectedResult(Failure):
+
+	def __init__( self, result, job=None ):
+		Failure.__init__(self, value=result, job=job)
 
 class Timeout(Failure):
 
@@ -174,6 +185,34 @@ class Timeout(Failure):
 
 	def isTimeout( self ):
 		return True
+
+class Future(Result):
+
+	def __init__( self ):
+		Result.__init__(self, None)
+		self.callback = None
+
+	def isPending( self ):
+		return True
+
+	def set( self, value ):
+		self.value = value
+		if self.callback: self.callback(value)
+		return self
+
+	def onset( self, callback):
+		self.callback = callback
+		return self
+
+	def isSuccess( self ):
+		return self.value and self.value.isSuccess()
+
+	def isFailure( self ):
+		return self.value and self.value.isFailure()
+
+	def isTimeout( self ):
+		return self.value and self.value.isTimeout()
+
 
 # -----------------------------------------------------------------------------
 #
@@ -195,7 +234,7 @@ class Job:
 	RUN           = AS_FUNCTION
 	RETRIES       = 5
 	RETRIES_DELAY = (60 * 1, 60 * 5, 60 * 10, 60 * 15)
-	PROPERTIES    = (
+	CORE_PROPERTIES = (
 		"timeout",
 		"scheduled",
 		"submitted",
@@ -206,8 +245,11 @@ class Job:
 		"retries",
 		"lastRun",
 		"type",
-		"status"
+		"status",
+		"out",
+		"err",
 	)
+	PROPERTIES = ()
 
 	@classmethod
 	def Registered( cls, jobClass ):
@@ -249,6 +291,9 @@ class Job:
 			job       = Job()
 			job.isUnresolved = export
 		# NOTE: The following list is the list of all the Job's properties
+		for k in cls.CORE_PROPERTIES:
+			if export.has_key(k):
+				setattr(job, k, export[k])
 		for k in cls.PROPERTIES:
 			if export.has_key(k):
 				setattr(job, k, export[k])
@@ -262,20 +307,24 @@ class Job:
 		return job
 
 	@classmethod
-	def Shell( cls, command, cwd="." ):
+	def Shell( cls, command, cwd=".", env=None ):
 		if type(command) in (tuple, list): command = " ".join(command)
 		# FIXME: Subprocess is sadly a piece of crap, cmd.wait() can still
 		# be blocking in cases where os.popen() would not block at all.
-		cmd      = subprocess.Popen(command, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, cwd=cwd, env=dict(LANG="C"))
+		# NOTE: You might want to specify env env=dict(LANG="C")
+		if env:
+			cmd      = subprocess.Popen(command, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, cwd=cwd, env=env)
+		else:
+			cmd      = subprocess.Popen(command, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, cwd=cwd)
 		# NOTE: is the status really necessary?
 		status   = cmd.wait()
 		res, err = cmd.communicate()
 		if status == 0:
-			return res
+			return (res, err)
 		else:
-			return err
+			return (res, err)
 
-	def __init__( self, env=None ):
+	def __init__( self, env=None, **kwargs ):
 		self.timeout      = -1
 		self.scheduled    = -1
 		self.submitted    = -1
@@ -291,7 +340,14 @@ class Job:
 		self.type         = self.__class__.__module__ + "." + self.__class__.__name__.split(".")[-1]
 		self.status       = None
 		self.result       = None
+		self.err          = ""
+		self.out          = ""
 		self._onProgress  = []
+		for k,v in kwargs.items():
+			if k in self.CORE_PROPERTIES or self.PROPERTIES:
+				setattr(self, k, v)
+			else:
+				err("Job {0} does not define a property {1}".format(self, k))
 		assert "id" not in self.DATA, "DATA does not allow an 'id' attribute"
 
 	def setStatus( self, status ):
@@ -309,6 +365,9 @@ class Job:
 				_(progress,_)
 		except Exception, e:
 			err("Exception in job progress callback: " + str(e))
+
+	def isInProcess( self ):
+		return self.status == JOB_IN_PROCESS
 
 	def isComplete( self ):
 		return self.result and isinstance(self.result, Success)
@@ -348,20 +407,34 @@ class Job:
 		"""The main Job function that you'll override when implementing the Job"""
 		raise Exception("Job.run not implemented")
 
-	def shell( self, command, cwd="." ):
-		return self.Shell(command, cwd)
+	def shell( self, command, cwd=".", env=None):
+		out, err = self.Shell(command, cwd, env=env)
+		self.out += out
+		self.err += err
+		return out, err
+
+	def shellsafe( self, value ):
+		return shellsafe(value)
+
+	def failure( self, description=None, value=None ):
+		return Failure(description=description, value=value, job=self)
+
+	def success( self, value=None ):
+		return Success(value or self)
 
 	def export( self ):
 		# If the job is unresolved, then we export the same data that was
 		# imported
 		if self.isUnresolved: return self.isUnresolved
 		result_export = None
+		# FIXME: We can't include the result in the export because the
+		# result includes the Job
 		if self.result:
 			result_export = self.result.export()
-		# FIXME: This should be from all attributes
 		data = {}
+		# FIXME: Not sure if we should exclude PROPERTIES
 		for field in self.DATA: data[field] = getattr(self, field)
-		base = dict([(k,getattr(self,k)) for k in self.PROPERTIES])
+		base = dict([(k,getattr(self,k)) for k in list(self.PROPERTIES) + list(self.CORE_PROPERTIES)])
 		base["data"] = data
 		return base
 
@@ -382,8 +455,10 @@ class Job:
 class Worker:
 
 	def __init__( self ):
-		self.job = None
-		self.onJobEnd = []
+		self.job       = None
+		self._join     = None
+		self.onJobEnd  = []
+		self.isRunning = False
 
 	def setJob( self, job, onJobEnd=None ):
 		"""Workers can only be assigned one job at a time."""
@@ -393,36 +468,56 @@ class Worker:
 		self.job = job
 		return self
 
+	@property
+	def isAvailable( self ):
+		return not self.isRunning
+
 	def run( self, runType=None ):
-		assert not self.isAvailable(), "No job set for this worker"
+		assert self.job, "No job set for this worker"
+		assert not self.isRunning, "Worker is already running the job"
 		# NOTE: Here the run method CAN NOT FAIL or TIMEOUT. It ALWAYS have to
 		# return a result, which is either a Success, Failure or Timeout.
 		# In practive, if run_type is `AS_FUNCTION` then it can actually
 		# fail and timeout, but for other run types, it won't.
+		self.isRunning = True
 		run_type   = runType or self.job.getRunType()
 		assert run_type in (AS_FUNCTION, AS_THREAD, AS_PROCESS), "Unkown run type for worker: %s" % (repr(run_type))
 		if   run_type == AS_FUNCTION:
 			try:
 				result = self._runAsFunction(self.job)
 			except Exception, e:
-				err("Job {0} failed with exception: {1}".format(job, e))
+				logging.error("Job {0} failed with exception: {1}".format(self.job, e))
 				result = Failure("Job failed with exception %s" % (e))
 		elif run_type == AS_THREAD:
-			result = Failure("Job run type %s not implemented" % (self.runType))
+			try:
+				result = self._runAsThread(self.job)
+			except Exception, e:
+				logging.error("Job {0} failed with exception: {1}".format(self.job, e))
+				result = Failure("Job failed with exception %s" % (e))
 		elif run_type == AS_PROCESS:
-			result = Failure("Job run type %s not implemented" % (self.runType))
+			result = Failure("Job run type %s not implemented" % (run_type))
 		else:
-			result = Failure("Uknown job run type: %s" % (self.runType))
+			result = Failure("Uknown job run type: %s" % (run_type))
 		# The job is assigned a result
 		self.job.setResult(result)
 		return result
 
 	def doJobEnd( self, result ):
+		logging.trace("Worker: job ended {0}:{1}".format(self.job, result))
 		for callback in self.onJobEnd:
 			try:
 				callback(result, self)
 			except Exception, e:
-				err("Callback failed on worker's job end: %s for %s in %s" % (callback, result, self))
+				logging.error("Callback failed on worker's job end: %s for %s in %s" % (callback, result, self))
+		self.job       = None
+		self.isRunning = False
+
+	def join( self ):
+		"""Synchronously waits for the completion of this worker."""
+		if self._join:
+			self._join()
+			self._join = None
+		return self
 
 	def _setResultTime( self, result, startTime ):
 		end_time = time.time()
@@ -430,30 +525,43 @@ class Worker:
 		result.started  = startTime
 		result.duration = end_time - startTime
 
-	def _runAsFunction( self, job ):
+	# FIXME: These should first detect wether a job returns a success or
+	# a failure.
+	def _runAsFunction( self, job, future=None ):
 		result = None
 		start_time = time.time()
+		logging.trace("Worker: job started {0}".format(self.job))
 		try:
 			result = Success(job.run())
+			if future: future.set(result)
 		except Exception, e:
 			error_msg = StringIO.StringIO()
 			traceback.print_exc(file=error_msg)
 			error_msg = error_msg.getvalue()
 			result = Failure(error_msg, job=job)
+			if future: future.set(result)
 		self._setResultTime(result, start_time)
+		if future: self._setResultTime(future, start_time)
 		# We have to put the doJobEnd here, as callbacks might fail or
 		# take too long
 		self.doJobEnd(result)
 		return result
 
 	def _runAsThread( self, job ):
-		pass
+		"""Runs the given job as a thread, and returns a `Future` instance."""
+		assert not self._join
+		result = Future()
+		def target(job=job, future=result):
+			self._runAsFunction(job, future)
+			self._join = None
+		thread = threading.Thread(target=target)
+		thread.start()
+		self._join = lambda: thread.join()
+		return result
 
 	def _runAsProcess( self, job ):
 		pass
 
-	def isAvailable( self ):
-		return self.job is None
 
 # -----------------------------------------------------------------------------
 #
@@ -467,9 +575,16 @@ class Pool:
 
 	def __init__(self, capacity=5):
 		"""Creates a default pool with the given capacity (5 by default)"""
-		self.capacity     = capacity
-		self._semaphore   = threading.BoundedSemaphore(self.capacity)
-		self._workersCount = 0
+		self.capacity      = capacity
+		self._semaphore    = threading.BoundedSemaphore(self.capacity)
+		self._activeCount = 0
+		self._workers      = [Worker() for _ in range(capacity)]
+
+	def nextAvailableWorker( self ):
+		for _ in self._workers:
+			if _.isAvailable:
+				return _
+		return None
 
 	def submit(self, job, block=False):
 		"""Submits a job to the pool. This will create a worker and
@@ -477,8 +592,10 @@ class Pool:
 		if self.canAdd() or block:
 			# NOTE: This is only blocking if canAdd is False
 			self._semaphore.acquire()
-			self._workersCount += 1
-			return Worker().setJob(job, self._onWorkerJobEnd)
+			self._activeCount += 1
+			worker = self.nextAvailableWorker().setJob(job, self._onWorkerJobEnd)
+			self._workers.append(worker)
+			return worker
 		else:
 			return None
 
@@ -486,15 +603,20 @@ class Pool:
 		"""Callback called when a workers's job has ended (wether with a
 		success or failure)"""
 		self._semaphore.release()
-		self._workersCount -= 1
+		self._activeCount -= 1
 
 	def canAdd(self):
 		"""Tells if a new worker can be started in this pool"""
 		return self.count() < self.capacity
 
 	def count(self):
-		"""Returns the number of workers in the queue"""
-		return self._workersCount
+		"""Returns the number of active workers in the queue"""
+		return self._activeCount
+
+	def join( self ):
+		"""Joins the workers."""
+		for _ in self._workers: _.join()
+		return self
 
 # -----------------------------------------------------------------------------
 #
@@ -599,7 +721,7 @@ class Incident:
 			try:
 				callback(self)
 			except Exception, e:
-				err("Exception in incident's callback: %s" % (e))
+				logging.error("Exception in incident's callback: %s" % (e))
 
 	def __str__( self ):
 		return "%s:%s" % (self.jobTag, self.failureTag)
@@ -621,7 +743,6 @@ class Queue:
 
 	def __init__( self ):
 		self.pool          = Pool()
-		self.jobs          = []
 		self.incidents     = []
 		self._runningJobs  = []
 		self._lastSelected = -1
@@ -654,7 +775,6 @@ class Queue:
 			else:
 				job.submitted = timestamp ()
 				return self._submitJob(job, job.setStatus(JOB_SUBMITTED if job.retries == 0 else JOB_RESUBMITTED))
-
 	def process( self, jobOrID):
 		"""Processes the given job. This will mark it as in process and
 		run it"""
@@ -668,30 +788,38 @@ class Queue:
 		# Makes sure the pool can process the event
 		# ...if not, we return the maximum time in which the pool will be free/or a callback to when the pool will be free
 		self._runningJobs.append(job)
+		# STEP 1: We try to run the job and see if it raises a result
 		if not job.isUnresolved:
 			if not self.pool:
 				raise Exception("Workqueue has no associated worker pool (see `setPool`)")
 			worker = self.pool.submit(job, block=True)
 			# Now we have the worker and we ask it to run the job
-			info("{0} IN PROCESS {1}".format(self.__class__.__name__,  job))
+			logging.info("{0} IN PROCESS {1}".format(self.__class__.__name__,  job))
 			try:
 				result = worker.run()
 			except Exception, e:
-				err("{0} EXCEPTION while running job {1}: {2}".format(self.__class__.__name, job, e))
+				logging.error("{0} EXCEPTION while running job {1}: {2}".format(self.__class__.__name__, job, e))
 				result = Failure(str(e), value=e, job=job)
 		else:
-			err("{0} UNRESOLVED {1}".format(self.__class__.__name__, job))
+			logging.error("{0} UNRESOLVED {1}".format(self.__class__.__name__, job))
 			result = Failure("Unresolved job")
-		if   isinstance(result, Success):
-			info("{0} SUCCESS   {1}:{2}".format(self.__class__.__name__, job, result))
+		if  result.isSuccess():
+			logging.info("{0} SUCCESS   {1}:{2}".format(self.__class__.__name__, job, result))
 			job.retries = 0
 			# the job is successfully processed
 			self._onJobSucceeded(job, result)
-		elif isinstance(result, Failure):
+			self._runningJobs.remove(job)
+		elif result.isFailure():
+			logging.warning("{0} FAILURE   {1}:{2}".format(self.__class__.__name__, job, result))
 			self._onJobFailed(job, result)
+			self._runningJobs.remove(job)
+		elif result.isPending():
+			logging.info("{0} PENDING   {1}:{2}".format(self.__class__.__name__, job, result))
+			assert isinstance(result, Future)
+			result.onset(lambda _:self._onJobFinished(job,_))
 		else:
+			logging.warning("{0} FAILURE   {1}:{2}".format(self.__class__.__name__, job, result))
 			self._onJobFailed(job, UnexpectedResult(result))
-		self._runningJobs.remove(job)
 		return result
 
 	def resubmit( self, job ):
@@ -746,11 +874,16 @@ class Queue:
 		"""Tells how many jobs are pending/incoming"""
 		raise NotImplementedError
 
+	def join( self ):
+		"""Waits until all the queue's workers are done."""
+		self.pool.join()
+		return self
+
 	def iterate( self, count=-1 ):
 		while (count == -1 or count > 0) and self._hasJobs():
 			# Takes the next available job
 			job = self._getNextJob()
-			info("{0} SUBMIT     {1}".format(self.__class__.__name__, job))
+			logging.info("{0} SUBMIT     {1}".format(self.__class__.__name__, job))
 			result = self.process(job)
 			if count > 0: count -= 1
 			# Takes care of cleaning up the queue if it's necessary
@@ -774,6 +907,12 @@ class Queue:
 			iteration += 1
 		return iteration
 
+	def _onJobFinished( self, jobOrJobID, result):
+		if result.isSuccess():
+			return self._onJobSucceeded(jobOrJobID, result)
+		else:
+			return self._onJobFailed(jobOrJobID, result)
+
 	def _onJobSucceeded( self, jobOrJobID, result ):
 		job = self._job(jobOrJobID)
 		self.complete(job)
@@ -787,22 +926,22 @@ class Queue:
 		if incident.isAboveThreshold():
 			# If the incident is above threshold, we won't retry the job,
 			# as it's likely to fail again
-			warn("{0} !INCIDENT {1}:{2} with {3}".format(self.__class__.__name__, job.id, incident, failure))
+			logging.warning("{0} !INCIDENT {1}:{2} with {3}".format(self.__class__.__name__, job.id, incident, failure))
 			self.failure(job)
 		elif job.canRetry():
 			# If the incident is not above threshold, and the job has not
 			# reached its retry count, we resubmit it
-			warn("{0} !RESUBMIT {1}/{2} because of {3}".format(self.__class__.__name__, job.id, job.retries, failure))
+			logging.warning("{0} !RESUBMIT {1}/{2} because of {3}".format(self.__class__.__name__, job.id, job.retries, failure))
 			self.resubmit(job)
 		else:
 			# Otherwise we remove the job from the queue
-			warn("{0} !MAXRETRY {1}/{2} after {3}".format(self.__class__.__name__, job.id, job.retries, failure))
+			logging.warning("{0} !MAXRETRY {1}/{2} after {3}".format(self.__class__.__name__, job.id, job.retries, failure))
 			self.failure(job)
 		return incident
 
 	def _getIncident( self, job, failure ):
 		"""Returns and incident that matches the job and failure"""
-		assert isinstance(failure, Failure),"A Failure instance is expected, got {0}".format(failure)
+		assert failure.isFailure(),"A Failure instance is expected, got {0}".format(failure)
 		for incident in self.incidents:
 			if incident.log(job, failure):
 				return incident
@@ -882,13 +1021,15 @@ class MemoryQueue(Queue):
 	def _getNextJob( self ):
 		"""Returns the next job and sets it as selected in this queue"""
 		if self.jobs:
-			return self.jobs[0]
+			for _ in self.jobs:
+				if not _.isInProcess():
+					return _
 		else:
 			return None
 
 	def _hasJobs( self ):
 		"""Tells if there are still jobs submitted in the queue"""
-		return self.jobs
+		return self._getNextJob() and True or False
 
 	def _listJobs( self, status=None ):
 		return self.jobs
@@ -992,7 +1133,7 @@ class DirectoryQueue(Queue):
 				elif JOB_REMOVED     in status: keep = JOB_REMOVED
 				status.remove(keep)
 				for _ in status:
-					warn("Removing duplicate job file {0}/{1} {2}".format(_, status, self._getPath(job, _)))
+					logging.warning("Removing duplicate job file {0}/{1} {2}".format(_, status, self._getPath(job, _)))
 					self._removeJobFile(job, _)
 
 	def read( self, path, sync=True ):
@@ -1095,20 +1236,20 @@ class DirectoryQueue(Queue):
 		if job:
 			self._removeJobFile(job, previousStatus or job.status)
 		else:
-			debug("DirectoryQueue job already removed {0}".format(job))
+			logging.debug("DirectoryQueue job already removed {0}".format(job))
 
 	def _writeJob( self, job ):
 		path = self._getPath(job)
 		if path:
-			debug("DirectoryQueue save   {0}".format(path[len(self.path):]))
+			logging.debug("DirectoryQueue save   {0}".format(path[len(self.path):]))
 			self.write(asJSON(job.export()), path)
 		else:
-			debug("DirectoryQueue cannot find path for job {0}".format(job))
+			logging.debug("DirectoryQueue cannot find path for job {0}".format(job))
 
 	def _removeJobFile( self, job, status=None ):
 		"""Physically removes the job file."""
 		path = self._getPath(job, status)
-		debug("DirectoryQueue remove {0}".format(path[len(self.path):]))
+		logging.debug("DirectoryQueue remove {0}".format(path[len(self.path):]))
 		if os.path.exists(path): os.unlink(path)
 
 	def _getPath( self, job, status=None ):
@@ -1167,13 +1308,13 @@ class DirectoryQueue(Queue):
 			path = matching_path[0]
 		# If the path exists, we load the job and return it
 		if path and os.path.exists(path):
-			debug("DirectoryQueue read   {0}".format(path[len(self.path):]))
+			logging.debug("DirectoryQueue read   {0}".format(path[len(self.path):]))
 			try:
 				job = json.loads(self.read(path))
 			except ValueError, e:
 				# FIXME: We should do something with that!
 				# If we're here, we can't decode the JSON properly
-				error("Corrupt job file: " + str(path))
+				logging.error("Corrupt job file: " + str(path))
 				return None
 			job = Job.Import(job, job_id)
 			# NOTE: We override the job status contained in the JSON
@@ -1224,7 +1365,8 @@ class HTTPQueue(Queue):
 
 class Daemon:
 	"""A very simple class that wraps a queue and runs it, sleep and waking
-	up every second to check for more work."""
+	up every second to check for more work. This daemon will take over the
+	main loop."""
 
 	def __init__( self, queue=None, period=1 ):
 		self.queue       = queue
@@ -1239,7 +1381,7 @@ class Daemon:
 				try:
 					signal.signal(getattr(signal,sig), self.onSignal)
 				except Exception, e:
-					error("Cannot register signals: {0}".format(e))
+					logging.error("Cannot register signals: {0}".format(e))
 
 	def run( self ):
 		self._registerSignals()
@@ -1247,7 +1389,7 @@ class Daemon:
 		while self.isRunning:
 			if self.queue.run(1) == 0 and self.isRunning:
 				t = time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime())
-				info("{0} - No job left, sleeping for {1}s".format(t, self.sleepPeriod))
+				logging.info("{0} - No job left, sleeping for {1}s".format(t, self.sleepPeriod))
 				time.sleep(self.sleepPeriod)
 
 	def stop( self ):
